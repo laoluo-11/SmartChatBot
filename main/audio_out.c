@@ -93,9 +93,9 @@ void audio_out_play_tone(uint16_t  freq_hz,uint32_t  duration_ms)
 
     /* 生成正弦波：每个样本 = sin(2π·f·t) × 振幅。
      *   t = i / sr 表示第 i 个样本的时间点（秒）
-     *   振幅用 30000（不是满量程 32767），留一点余量防止破音/削顶失真 */
+     *   振幅用 8000（留充足余量，不吵耳） */
      for(int i=0; i < total; i++){
-        buf[i] = (int16_t)(sinf(2.0f * MY_PI * freq_hz * i / sr)*30000.0f);
+        buf[i] = (int16_t)(sinf(2.0f * MY_PI * freq_hz * i / sr)*8000.0f);
      }
      /* 把缓冲区写给功放。一次可能写不完 32KB（I2S 内部 DMA 缓冲有限），
      * 所以用 while 循环、每次最多写 4KB，直到全部样本发完。 */
@@ -129,11 +129,13 @@ void audio_out_play_tone(uint16_t  freq_hz,uint32_t  duration_ms)
 
 void audio_out_task(void *pvParaments)
 {
-    (void)pvParaments;  // 本任务不接收参数
-    /* 给 I2S/DMA 一点启动时间，避免第一声被截断 */
+    (void)pvParaments;
     vTaskDelay(pdMS_TO_TICKS(500));
+
     while (1) {
-        audio_out_play_tone(1000,1000);      // 播放 1kHz 正弦波 1 秒
-        vTaskDelay(pdMS_TO_TICKS(2000));    // 静音 2 秒，循环
+        audio_out_play_tone(1000, 1000);         // 播放 1 秒
+        i2s_channel_disable(spk_tx_chan);         // ← 关 I2S，BCLK/WS 停止，MAX98357A 自动静音
+        vTaskDelay(pdMS_TO_TICKS(2000));          // ← 真正安静的 2 秒（芯片已关断）
+        i2s_channel_enable(spk_tx_chan);          // ← 重新打开 I2S
     }
 }
