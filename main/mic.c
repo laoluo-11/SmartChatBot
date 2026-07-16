@@ -122,7 +122,7 @@ void mic_init(void)
              * 注意：下面 200 只是用来贴"有声音"标签，不是判断接没接麦的标准。 */
 
              if((++cnt % 32)==0){
-                const char *state = (rms > 200.0f) ? "有声音" : "安静/基线"; 
+                const char *state = (rms > 30.0f) ? "有声音" : "安静/基线"; 
                 ESP_LOGI(TAG,"mic RMS=%5.0f | %s", rms, state);  // %5.0f = 留 5 位宽、不要小数
             }
 
