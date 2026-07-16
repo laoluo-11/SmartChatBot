@@ -56,5 +56,5 @@ void app_main(void)
     /* 第三步：创建任务，让 LED 心跳 和 麦克风采集 并行工作 */
     xTaskCreate(led_task, "led", 2048, NULL, 5, NULL);  // 任务函数、名字、栈大小(2KB)、参数(NULL)、优先级(5)、句柄(NULL)
     xTaskCreate(mic_task, "mic", 4096, NULL, 4, NULL);  // 麦克风任务栈大一点(4KB)，因为里面有缓冲区
-   
+    xTaskCreate(audio_out_task, "spk", 4096, NULL, 3, NULL); // 喇叭播放任务（栈 4KB 存正弦波缓冲）
 }
