@@ -29,7 +29,7 @@ esp_err_t oled_init(void);
 void oled_draw_pixel(int x, int y, bool on);
 void oled_clear(void);
 void oled_refresh(void);
-
-
-
-
+void oled_draw_text(int x, int y, const char *str);
+void oled_show_lines(const char *l0, const char *l1, const char *l2, const char *l3);
+void oled_show_status(const char *status);
+void oled_task(void *pvParameters);

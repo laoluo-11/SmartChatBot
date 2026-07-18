@@ -26,6 +26,7 @@
 #include "led.h"               // 引入 LED 模块（拿到 led_task 声明）
 #include "mic.h"               // 引入麦克风模块（拿到 mic_init / mic_task 声明）
 #include "audio_out.h"          // 引入喇叭模块（拿到 audio_out_init / audio_out_task 声明）
+#include "oled.h"             // 引入 OLED 模块（拿到 oled_init / oled_show_status 声明）
 
 static const char *TAG = "main";  // 本文件日志标签："main: ..."（入口相关的日志归这里）
 
@@ -52,9 +53,12 @@ void app_main(void)
      * 麦克风需要先"打开"(mic_init) 再交给任务去循环采集。LED 很简单，任务里自己会配置 GPIO。 */
     mic_init();        // 打开并配置 I2S 麦克风通道（建通道 + 配置引脚 + 启用）
     audio_out_init();  // 打开并配置 I2S 喇叭发送通道（建通道 + 配置引脚 + 启用）
+    oled_init();       // 初始化 OLED 显示屏
 
     /* 第三步：创建任务，让 LED 心跳 和 麦克风采集 并行工作 */
     xTaskCreate(led_task, "led", 2048, NULL, 5, NULL);  // 任务函数、名字、栈大小(2KB)、参数(NULL)、优先级(5)、句柄(NULL)
     xTaskCreate(mic_task, "mic", 4096, NULL, 4, NULL);  // 麦克风任务栈大一点(4KB)，因为里面有缓冲区
     xTaskCreate(audio_out_task, "audio_out", 4096, NULL, 4, NULL);  // 喇叭任务栈大一点(4KB)，因为里面有缓冲区
+    xTaskCreate(oled_task, "oled", 2048, NULL, 3, NULL);  // OLED 显示任务
 }
+    

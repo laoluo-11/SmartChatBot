@@ -27,7 +27,7 @@
 #include "freertos/FreeRTOS.h"      // vTaskDelay 等
 #include "esp_log.h"                //ESP_LOGI
 #include "esp_lcd_panel_io.h"        // panel IO（含 I2C 的 io 配置）
-#include "esp_lcd_panel_ssd1306"     // SSD1306 专用配置 + 建面板
+#include "esp_lcd_panel_ssd1306.h"   // SSD1306 专用配置 + 建面板
 #include "esp_lcd_panel_ops.h"       // panel 句柄、draw_bitmap、init/reset
 #include "driver/i2c_master.h"       // v6 的 I2C 主总线 API
 
@@ -52,7 +52,7 @@ static esp_lcd_panel_handle_t g_panel = NULL;
  * oled_init：初始化 OLED（建 I2C 总线 → panel IO → SSD1306 面板）
  * ------------------------------------------------------------------------- */
 
- esp_err_t oled_init(void)
+esp_err_t oled_init(void)
  {
 
     /* 步骤 1：建一条 I2C 主总线。
@@ -64,7 +64,7 @@ static esp_lcd_panel_handle_t g_panel = NULL;
         .scl_io_num        = OLED_I2C_SCL_GPIO, // SCL → GPIO42
         .clk_source        = I2C_CLK_SRC_DEFAULT, // 默认时钟源
         .glitch_ignore_cnt = 7,                   // 抗毛刺（官方推荐值）
-        enable_internal_pullup = true,            // 开启内部上拉
+        .flags.enable_internal_pullup = true,     // 开启内部上拉
     };
     i2c_master_bus_handle_t bus_handle = NULL;
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg,&bus_handle));
@@ -83,7 +83,7 @@ static esp_lcd_panel_handle_t g_panel = NULL;
         .lcd_param_bits        = 8,
         // flags 留默认：DC=1 表示数据、DC=0 表示命令（SSD1306 标准）
 
-     }
+     };
      esp_lcd_panel_io_handle_t io_handle = NULL;
      ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(bus_handle,&io_cfg,&io_handle));
 
@@ -98,7 +98,7 @@ static esp_lcd_panel_handle_t g_panel = NULL;
         .bits_per_pixel  = 1,
         .reset_gpio_num  = -1,
         .vendor_config   = &ssd1306_cfg,
-    }
+    };
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_ssd1306(io_handle,&panel_cfg,&g_panel));
 
@@ -216,8 +216,10 @@ void oled_task(void *pvParameters)
     const char *states[] = {"BOOT", "IDLE", "LISTEN", "THINK", "SPEAK"};
     int i = 0;
     while (1) {
+
         oled_show_status(states[i % (sizeof(states) / sizeof(states[0]))]);
         i++;
+        
         vTaskDelay(pdMS_TO_TICKS(2000));   // 每 2 秒切换一次
     }
 }
