@@ -183,3 +183,41 @@ void oled_draw_text(int x, int y, const char *str)
     }
 }
 
+/* -------------------------------------------------------------------------
+ * oled_show_lines：一次性显示最多 4 行（清屏 + 画字 + 刷新）
+ * ------------------------------------------------------------------------- */
+
+void oled_show_lines(const char *l0, const char *l1, const char *l2, const char *l3)
+{
+    oled_clear();
+    if (l0) oled_draw_text(0, 0,  l0);   // 第 0 行（y=0）
+    if (l1) oled_draw_text(0, 8,  l1);   // 第 1 行（y=8）
+    if (l2) oled_draw_text(0, 16, l2);   // 第 2 行（y=16）
+    if (l3) oled_draw_text(0, 24, l3);   // 第 3 行（y=24）
+    oled_refresh();
+}
+
+/* -------------------------------------------------------------------------
+ * oled_show_status：显示“STATE:”+ 状态（给后面状态机用）
+ * ------------------------------------------------------------------------- */
+
+ void oled_show_status(const char *status)
+{
+    oled_show_lines("STATE:", status, NULL, NULL);
+}
+
+/* -------------------------------------------------------------------------
+ * oled_task：L4 演示任务——循环切换状态，方便肉眼验收
+ * ------------------------------------------------------------------------- */
+void oled_task(void *pvParameters)
+{
+    (void)pvParameters;   // 本任务用不到入参，加这句消除“未使用”警告
+    /* 模拟后面状态机的几个状态，每 2 秒换一个，肉眼看屏幕是否在变 */
+    const char *states[] = {"BOOT", "IDLE", "LISTEN", "THINK", "SPEAK"};
+    int i = 0;
+    while (1) {
+        oled_show_status(states[i % (sizeof(states) / sizeof(states[0]))]);
+        i++;
+        vTaskDelay(pdMS_TO_TICKS(2000));   // 每 2 秒切换一次
+    }
+}

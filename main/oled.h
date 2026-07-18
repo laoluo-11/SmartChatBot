@@ -17,6 +17,7 @@
  *   - oled_task()         ：L4 演示任务，循环切状态方便肉眼验收
  * ========================================================================= */
 
+
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -25,6 +26,10 @@
 /* 初始化 OLED（建 I2C 总线 + SSD1306 面板）。必须在其它 oled_xxx 之前调用。
  * 返回 ESP_OK 表示成功；失败会在内部 ESP_ERROR_CHECK 中止（初始化不过没必要继续）。 */
 esp_err_t oled_init(void);
+void oled_draw_pixel(int x, int y, bool on);
+void oled_clear(void);
+void oled_refresh(void);
+
 
 
 
