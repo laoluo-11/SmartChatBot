@@ -18,6 +18,7 @@
 #include "button.h"
 #include "driver/gpio.h"        // gpio_config / 中断相关 API
 #include "esp_attr.h"           // IRAM_ATTR：把中断函数放进 RAM，运行更稳
+#include "esp_err.h"
 #include "freertos/queue.h"     // 队列：在中断和任务之间传递"按下"事件
 #include "esp_log.h"
 #include <stdint.h>             // intptr_t：把 gpio 号安全地塞进 void* 参数
@@ -41,6 +42,10 @@ static const int s_btn_gpio[BTN_ACTION_COUNT] = {
 /* 中断服务程序（ISR）：尽量短，只往队列丢"被按下的 gpio 号" */
 static void IRAM_ATTR button_isr(void *arg)
 {
+    if (s_btn_queue == NULL) {
+        return;
+    }
+
     int gpio = (int)(intptr_t)arg;          // 注册 ISR 时把 gpio 号当参数传进来了
     BaseType_t higher_woken = pdFALSE;
     /* 从 ISR 里发队列：必须用 FromISR 版本；higher_woken 标记是否有更高优先级任务被唤醒 */
@@ -50,8 +55,13 @@ static void IRAM_ATTR button_isr(void *arg)
     }
 }
 
-void button_init(void)
+esp_err_t button_init(void)
 {
+    if (s_btn_queue != NULL) {
+        ESP_LOGW(TAG, "按键模块已初始化，跳过重复初始化");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     /* 把三个 gpio 拼成一个位掩码（一次配置三个脚） */
     uint64_t mask = 0;
     for (int i = 0; i < BTN_ACTION_COUNT; i++) {
@@ -66,19 +76,42 @@ void button_init(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_NEGEDGE,      // 下降沿：高(1)->低(0) 的瞬间触发
     };
-    ESP_ERROR_CHECK(gpio_config(&io));
+    esp_err_t err = gpio_config(&io);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     /* 建队列：深度 4，元素大小 sizeof(int) —— 存"哪个脚被按了" */
     s_btn_queue = xQueueCreate(4, sizeof(int));
+    if (s_btn_queue == NULL) {
+        ESP_LOGE(TAG, "按键队列创建失败");
+        return ESP_ERR_NO_MEM;
+    }
 
     /* 安装 GPIO 中断服务，并给每个按键单独挂 ISR（arg 传各自的 gpio 号） */
-    gpio_install_isr_service(0);
+    err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        vQueueDelete(s_btn_queue);
+        s_btn_queue = NULL;
+        return err;
+    }
+
     for (int i = 0; i < BTN_ACTION_COUNT; i++) {
-        gpio_isr_handler_add(s_btn_gpio[i], button_isr, (void *)(intptr_t)s_btn_gpio[i]);
+        err = gpio_isr_handler_add(s_btn_gpio[i], button_isr, (void *)(intptr_t)s_btn_gpio[i]);
+        if (err != ESP_OK) {
+            for (int j = 0; j < i; j++) {
+                gpio_isr_handler_remove(s_btn_gpio[j]);
+            }
+            vQueueDelete(s_btn_queue);
+            s_btn_queue = NULL;
+            return err;
+        }
     }
 
     ESP_LOGI(TAG, "按键已就绪 (唤醒=GPIO%d, 音量-=GPIO%d, 音量+=GPIO%d, 下降沿触发)",
              BTN_WAKE_GPIO, BTN_VOL_DOWN_GPIO, BTN_VOL_UP_GPIO);
+
+    return ESP_OK;
 }
 
 void button_register_callback(void (*cb)(button_action_t action))
@@ -100,6 +133,12 @@ static button_action_t gpio_to_action(int gpio)
 void button_task(void *pvParameters)
 {
     (void)pvParameters;   // 本任务不接收外部参数
+    if (s_btn_queue == NULL) {
+        ESP_LOGE(TAG, "按键队列未初始化，任务退出");
+        vTaskDelete(NULL);
+        return;
+    }
+
     int gpio;
     while (1) {
         /* 一直等"按下"事件（没有就睡，不占 CPU） */

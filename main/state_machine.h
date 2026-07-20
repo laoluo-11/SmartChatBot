@@ -38,3 +38,10 @@ void bot_init(void);
  *   - 进入 SPEAKING 时额外播一声 1kHz 测试音，模拟机器人"开口"
  * 同状态重复设置会被忽略（避免重复播声音）。 */
 void bot_set_state(bot_state_t new_state);
+
+/* 状态机自动推进任务：监听麦克风 → 检测声音/静音 → 自动切状态。
+ * LISTENING: 等用户说话 → 静音后 → THINKING
+ * THINKING:  等待 5 秒 → SPEAKING
+ * SPEAKING:  等待 3 秒（喇叭播正弦波）→ IDLE
+ * 由 app_main 创建为 FreeRTOS 任务。 */
+void bot_state_task(void *pvParameters);

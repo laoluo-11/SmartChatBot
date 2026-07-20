@@ -14,6 +14,7 @@
 
 #include "mic.h"               // 本模块声明（引脚宏、mic_init/mic_task 原型）
 #include <stdio.h>            // 标准输入输出（习惯带上）
+#include <stdlib.h>           // malloc / free
 #include <math.h>             // 数学库，用 sqrtf() 开平方根算 RMS
 #include "freertos/FreeRTOS.h"// FreeRTOS 内核
 #include "freertos/task.h"    // 任务函数（xTaskCreate / vTaskDelete / vTaskDelay）
@@ -23,12 +24,18 @@
  * 这样可以避免不同模块之间变量名互相打架。 */
 static const char *TAG = "mic";                 // 本模块日志标签："mic: ..."
 static i2s_chan_handle_t mic_rx_chan = NULL;    // I2S 接收通道句柄（想象成麦克风的遥控器），先置空
+static float g_mic_rms = 0.0f;                   // 最近一次 RMS 值（状态机读取用）
 
 /* -------------------------------------------------------------------------
  * mic_init：打开并配置麦克风（只调用一次）
  * ------------------------------------------------------------------------- */
 void mic_init(void)
 {
+    if (mic_rx_chan != NULL) {
+        ESP_LOGW(TAG, "麦克风已初始化，跳过重复初始化");
+        return;
+    }
+
     /* 1) 通道配置：用哪个 I2S 控制器、ESP32 当主设备 */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_MIC_NUM, I2S_ROLE_MASTER);
 
@@ -104,6 +111,7 @@ void mic_task(void *pvParameters)
                 sum += (int64_t)s * s;          // 平方后累加
             }
             float rms = sqrtf((float)((double)sum / samples));  // 平均后再开根号 = RMS
+            g_mic_rms = rms;  // 更新全局 RMS 供状态机读取
 
             /* --- 大约每 1 秒打印一次音量仪表（即使安静也打印，方便你观察对比）---
              * 512 样本 @16kHz 只够 32 毫秒，循环很快；数 32 次循环（≈1秒）才打一行，不刷屏。
@@ -119,4 +127,9 @@ void mic_task(void *pvParameters)
             }
         }
     }
+}
+
+float mic_get_rms(void)
+{
+    return g_mic_rms;
 }

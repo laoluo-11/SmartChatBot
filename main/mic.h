@@ -26,4 +26,7 @@ void mic_init(void);
 /* 麦克风采集任务：循环读声音、算 RMS 音量、打印到串口。 */
 void mic_task(void *pvParameters);
 
+/* 获取最近一次 RMS 音量值（状态机用此判断有无声音） */
+float mic_get_rms(void);
+
 #endif /* MIC_H */

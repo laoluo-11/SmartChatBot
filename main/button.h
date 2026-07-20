@@ -21,6 +21,7 @@
  * ========================================================================= */
 
 #pragma once
+#include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -39,8 +40,8 @@ typedef enum {
     BTN_ACTION_COUNT    // 动作总数（仅用于边界，不要当动作用）
 } button_action_t;
 
-/* 初始化三个按键：配置各自 GPIO 上拉+下降沿中断，建一个事件队列。必须在最前调用。 */
-void button_init(void);
+/* 初始化三个按键：配置各自 GPIO 上拉+下降沿中断，建一个事件队列；失败会返回 esp_err_t。 */
+esp_err_t button_init(void);
 
 /* 按键任务：等中断发来的事件 -> 软件消抖 -> 按 gpio 映射到动作 -> 调用注册的回调。
  * 由 app_main 创建成任务。 */
