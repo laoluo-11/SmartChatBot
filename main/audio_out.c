@@ -131,7 +131,10 @@ void audio_out_task(void *pvParameters)
 
     while (1) {
         audio_out_play_tone(1000, 1000);       // 播放 1kHz 正弦波 1 秒
-        vTaskDelay(pdMS_TO_TICKS(2000));        // 静音 2 秒，循环
+        // 静音 2 秒，循环
+        i2s_channel_disable(spk_tx_chan);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        i2s_channel_enable(spk_tx_chan);
     }
 }
 
