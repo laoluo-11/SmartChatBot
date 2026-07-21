@@ -1,20 +1,24 @@
 /* =========================================================================
- * main.c —— 程序入口（第 5 关 L5：按键 + 状态机，把各模块串成"机器人"）
+ * main.c —— 程序入口（L5 按键+状态机 + L6 WiFi/NVS/SoftAP 配网）
  * -------------------------------------------------------------------------
  * 现在各硬件模块各司其职：
  *   - mic.c           ：麦克风采集（打印 RMS 音量，做"系统还活着"的指示）
  *   - audio_out.c     ：喇叭（audio_out_play_tone 播测试音）
  *   - oled.c          ：OLED（oled_show_status 显示状态，oled_draw_text 写任意字）
  *   - led.c           ：板载 RGB（led_set_color 按状态变色）
- *   - state_machine.c ：状态机（中枢：切状态时自动驱动 OLED + LED + 喇叭）
+ *   - state_machine.c ：状态机（中枢：切状态时自动驱动 OLED + LED）
  *   - button.c        ：按键（中断 → 队列 → 任务 → 回调，推进状态机）
+ *   - wifi.c          ：WiFi/配网（L6：NVS 存账号、SoftAP 热点+网页配网、STA 连家里）
  *
- * L5 的流程（一键触发全自动）：
+ * L5 对话流程（一键触发全自动）：
  *   按键1 (GPIO0  唤醒) → 进入 LISTENING → 等用户说话 → 静音后 → THINKING（5秒）
  *                      → SPEAKING（喇叭播 3 秒正弦波）→ 自动回 IDLE
  *   按键2 (GPIO39 音量-) → 喇叭音量 -10，屏幕显示 VOL xx%
  *   按键3 (GPIO40 音量+) → 喇叭音量 +10，屏幕显示 VOL xx%
  *
+ * L6 联网流程（开机自动）：
+ *   有存档账号 → STA 直连家里 WiFi（屏幕 CONNECTING → ONLINE）
+ *   无存档账号 → ESP32 变热点(ESP32-Chatbot) + 网页，手机填账号后存 NVS 并切 STA
  * 喇叭只在 SPEAKING 状态才发声，其他时候静音。
  * ========================================================================= */
 
@@ -30,6 +34,7 @@
 #include "oled.h"              // OLED 模块（oled_init / 清屏 / 画点 / 写字 / 显示）
 #include "state_machine.h"     // 状态机（bot_init / bot_set_state / bot_get_state / bot_state_to_str / bot_state_task）
 #include "button.h"            // 按键模块（button_init / button_task / button_register_callback）
+#include "wifi.h"              // WiFi / NVS / SoftAP 配网（L6 新增）
 
 static const char *TAG = "main";  // 本文件日志标签："main: ..."（入口相关的日志归这里）
 
@@ -66,6 +71,17 @@ static void on_button_pressed(button_action_t action)
         default:
             break;
     }
+}
+
+/* -------------------------------------------------------------------------
+ * on_wifi_connected：WiFi 真正连上（拿到 IP）时的回调。
+ * 由 wifi 模块在事件里异步调用，用来把 OLED/LED 显示成"在线"。
+ * ------------------------------------------------------------------------- */
+static void on_wifi_connected(void)
+{
+    ESP_LOGI(TAG, "WiFi 已连上，机器人进入在线状态");
+    oled_show_status("ONLINE");          // 屏幕显示 ONLINE
+    led_set_color(0, 255, 80);           // 绿灯：在线
 }
 
 /* -------------------------------------------------------------------------
@@ -154,6 +170,22 @@ void app_main(void)
     /* 第三步：初始化状态机（把当前状态设成 IDLE，并刷一次屏幕 + 灭灯） */
     bot_init();
 
+    /* 第三步半（L6）：初始化 WiFi 子系统，并按 NVS 里是否存过账号决定启动方式：
+     *   - 有存档账号 → 直接以 STA 模式连家里 WiFi（屏幕显示 CONNECTING）
+     *   - 没存档账号 → 进入配网模式（ESP32 自己变热点 + 网页，屏幕显示 PROVISION）
+     * 无论哪种，连上后 on_wifi_connected 会把屏幕刷成 ONLINE、灯变绿。 */
+    wifi_init();
+    wifi_register_connected_cb(on_wifi_connected);
+    if (wifi_has_saved_creds()) {
+        ESP_LOGI(TAG, "检测到已保存 WiFi 账号，尝试以 STA 连接...");
+        oled_show_status("CONNECTING");
+        wifi_try_connect_saved();
+    } else {
+        ESP_LOGI(TAG, "未配置 WiFi，进入配网模式（热点 ESP32-Chatbot）...");
+        bot_set_state(STATE_PROVISIONING);   // OLED 显示 PROVISION + 黄灯
+        wifi_start_provisioning();
+    }
+
     /* 第四步：注册"按键按下"的回调，并初始化按键（GPIO 中断 + 事件队列）。 */
     button_register_callback(on_button_pressed);
     esp_err_t btn_init_err = button_init();
@@ -185,5 +217,5 @@ void app_main(void)
     /* 第六步：开机自检——逐一调用各模块函数，确保硬件都通。 */
     demo_all_features();
 
-    ESP_LOGI(TAG, "系统就绪：按唤醒键开始对话（IDLE→LISTEN→THINK→SPEAK→IDLE 全自动）");
+    ESP_LOGI(TAG, "系统就绪：按唤醒键开始对话（IDLE→LISTEN→THINK→SPEAK→IDLE 全自动）；联网见上方日志");
 }

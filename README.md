@@ -15,8 +15,8 @@
 | **L2** | 麦克风采集 (INMP441 I2S IN) | 读 PCM + 计算 RMS 音量 | ✅ 通关 |
 | **L3** | 喇叭播放 (MAX98357A I2S OUT) | 播放测试音 | ✅ 通关 |
 | **L4** | OLED 显示 (SSD1306 I2C) | 状态/音量/RSSI | ✅ 通关 |
-| **L5** | 按键 + 状态机骨架 | IDLE/LISTENING/... 态切换 | 🔵 当前关 |
-| **L6** | WiFi + NVS + SoftAP 配网 | 配网持久化 | ⏳ |
+| **L5** | 按键 + 状态机骨架 | IDLE/LISTENING/... 态切换 | ✅ 通关 |
+| **L6** | WiFi + NVS + SoftAP 配网 | 配网持久化 + SoftAP 网页配网 | 🔵 当前关 |
 | **L7** | WebSocket 通信 + Opus 框架 | 上行音频/下行文本 | ⏳ |
 | **L8** | 唤醒词 (wakenet) | 离线唤醒 + 打断 | ⏳ |
 | **L9** | 离线兜底 (multinet) | 断网本地命令模式 | ⏳ |
@@ -284,3 +284,89 @@ idf.py -p COM3 flash monitor     # COM3 换成你的端口
 ---
 
 过完 L5，在对话里回我「**L5 过了**」或贴出监视器日志，我接着给 **L6 WiFi + NVS + SoftAP 配网** 的代码与接线（那时会真正连上你的路由器）。
+
+---
+
+## L6 · WiFi + NVS + SoftAP 配网（本关交付）
+
+在 L5 基础上让机器人能联网。核心目标是：**WiFi 账号密码不写死在代码里**，而是用
+**SoftAP 网页配网**：没配过时，ESP32 自己变成一个 WiFi 热点，手机连上去、浏览器打开网页、填家里
+WiFi 账号；提交后存进 **NVS（掉电不丢的小存储）**，ESP32 自动切回 STA 去连家里路由器。以后再上电，
+只要 NVS 里还有账号就直接连，无需重新配。
+
+### 这一关新增 / 变更了什么
+
+- **新增 `wifi.h` / `wifi.c`**：配网模块的全部实现。
+  - `wifi_init()`：初始化 NVS + TCP/IP 协议栈 + 事件循环 + STA/AP 网络接口（**不**真正连 WiFi）。
+  - `wifi_has_saved_creds()`：NVS 里是否存过账号。
+  - `wifi_try_connect_saved()`：用存档账号以 STA 模式连家里 WiFi（带断线自动重连）。
+  - `wifi_save_creds()`：把账号密码存进 NVS。
+  - `wifi_start_provisioning()`：启动 SoftAP 热点（`ESP32-Chatbot`，开放无密码）+ 轻量网页服务器
+    （`http://192.168.4.1`）。网页 POST 提交后存 NVS 并自动切回 STA。
+  - `wifi_register_connected_cb()`：注册"连上 WiFi"回调（main 用它刷 OLED 显示 ONLINE）。
+- **改 `state_machine.h` / `.c`**：新增 `STATE_PROVISIONING`（配网中）状态
+  （OLED 显示 `PROVISION`、板载灯变黄）。
+- **改 `main.c`**：加 `#include "wifi.h"` + `on_wifi_connected` 回调；`app_main` 在 `bot_init()` 后
+  插入联网分支（有存档账号→`CONNECTING` 直连；无存档→`PROVISION` 进配网）。
+- **改 `CMakeLists.txt`**：`SRCS` 加 `wifi.c`；`REQUIRES` 加
+  `esp_wifi esp_netif esp_http_server nvs_flash esp_event`（改后先 `idf.py reconfigure`）。
+
+### 配网流程（第一次上电 / 换网络时）
+
+```
+上电
+ ├─ NVS 有账号? ──是──> STA 直连家里 WiFi ──> 连上(ONLINE,绿) / 失败(自动重连)
+ └─ 无账号 ─────> 进入配网:
+       ESP32 变热点 "ESP32-Chatbot" (无密码)
+       手机连该热点 → 浏览器开 http://192.168.4.1
+       填家里 WiFi 的 SSID / 密码 → 提交
+       └─> 存进 NVS → ESP32 切 STA → 连家里 WiFi → ONLINE
+```
+
+### 编译 / 烧录 / 监视
+
+```bash
+idf.py reconfigure      # 改过 CMakeLists 的 REQUIRES 后必须重配
+idf.py build
+idf.py -p COM3 flash monitor     # COM3 换成你的端口
+```
+
+### ✅ 验收标准（通关条件）
+
+1. **首次上电（NVS 空）**：监视器看到
+   ```
+   I (xxx) wifi: 配网热点已启动：SSID=ESP32-Chatbot（开放，无密码）
+   I (xxx) wifi: 手机连上后，浏览器打开 http://192.168.4.1 填写家里 WiFi
+   ```
+   OLED 显示 `STATE: PROVISION`，板载灯变黄。
+2. 手机 WiFi 列表出现 `ESP32-Chatbot` 并连上；浏览器打开 `http://192.168.4.1` 看到配网网页。
+3. 填家里 WiFi 的 SSID/密码提交后：ESP32 日志出现
+   ```
+   I (xxx) wifi: 配网网页提交：SSID=你的WiFi名（已存 NVS）
+   I (xxx) wifi: 配网完成，切换到 STA 连接家里 WiFi: 你的WiFi名
+   I (xxx) wifi: 已连上 WiFi，IP = 192.168.x.x
+   ```
+   OLED 显示 `ONLINE`，灯变绿。
+4. **再次上电（NVS 已有账号）**：应**直接**以 STA 连家里 WiFi（不再进配网热点），看到
+   `CONNECTING` → `已连上 WiFi，IP=...`。说明账号持久化成功。
+5. L1–L5 功能不受影响：开机自检照常跑，按键仍能调音量/唤醒。
+
+### 🐞 常见坑
+
+- **编译报错 `cannot find -lesp_http_server` 或找不到头文件**：`CMakeLists.txt` 的 `REQUIRES`
+  漏了 `esp_http_server` / `esp_wifi` / `esp_netif` / `nvs_flash` / `esp_event`，补齐后 `idf.py reconfigure`。
+- **连不上家里 WiFi**：① 密码含 `&` 会被表单截断（已知简化限制，换简单密码或后续升级为 JSON）；
+  ② 路由器是 WPA3-only 且 `authmode` 设太高，可把 `sta.threshold.authmode` 放宽；
+  ③ 看日志是否 `WiFi 断开，重连中 (x/5)`，5 次后放弃——多半密码错。
+- **手机连上热点却打不开 `192.168.4.1`**：部分手机有"强制门户检测"，会跳到验证页但也能用；
+  直接在浏览器地址栏手输 `http://192.168.4.1`。确保手机**没同时开着蜂窝数据**导致流量被分流。
+- **配网后想重新配网**：在串口执行 `idf.py monitor` 时，可复位后按住 GPIO0（唤醒键）上电并不放
+  并不现实；更稳妥的做法是后续加"长按某键清 NVS"。本期可临时用
+  `idf.py erase_flash` 清掉 NVS 重新配（会清掉全部 NVS，包括 WiFi 账号）。
+- **`wifi_init` 里 NVS 初始化失败 `ESP_ERR_NVS_NO_FREE_PAGES`**：代码已自动 `nvs_flash_erase()`
+  重建，正常；若反复出现，可能分区表没 NVS 区，检查 `partitions.csv` 是否有 `nvs` 分区。
+
+---
+
+过完 L6，在对话里回我「**L6 过了**」或贴出监视器日志（含 `已连上 WiFi，IP=`），我接着给
+**L7 WebSocket 通信 + Opus 框架**（真正把语音/文本送到服务器）。

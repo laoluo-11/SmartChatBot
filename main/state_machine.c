@@ -46,6 +46,7 @@ const char *bot_state_to_str(bot_state_t s)
         case STATE_LISTENING: return "LISTENING";
         case STATE_THINKING:  return "THINKING";
         case STATE_SPEAKING:  return "SPEAKING";
+        case STATE_PROVISIONING: return "PROVISION";
         default:              return "UNKNOWN";
     }
 }
@@ -81,6 +82,7 @@ void bot_set_state(bot_state_t new_state)
         case STATE_LISTENING: led_set_color(0, 60, 255);  break;  // 蓝：在听
         case STATE_THINKING:  led_set_color(200, 0, 255); break;  // 紫：在想
         case STATE_SPEAKING:  led_set_color(0, 255, 80);  break;  // 绿：在说
+        case STATE_PROVISIONING: led_set_color(255, 255, 0); break; // 黄：配网中
         default: break;
     }
 

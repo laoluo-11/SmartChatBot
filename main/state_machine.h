@@ -18,6 +18,7 @@ typedef enum {
     STATE_LISTENING,   // 聆听：正在采集用户说话（将来接麦克风 VAD 人声检测）
     STATE_THINKING,    // 思考：把语音送服务器做 ASR+LLM，等回复
     STATE_SPEAKING,    // 说话：收到回复，TTS 后从喇叭播放
+    STATE_PROVISIONING,// 配网中：ESP32 变成热点，等手机来填家里 WiFi 账号
     STATE_COUNT        // 状态总数（仅用于边界判断，不要当它当状态用）
 } bot_state_t;
 
