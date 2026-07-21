@@ -123,9 +123,10 @@ static void demo_all_features(void)
 
     ESP_LOGI(TAG, "===== 开机自检完成 =====");
 
-    /* 恢复默认音量 30%，回到 IDLE 显示 */
+    /* 恢复默认音量 30%，并把开机屏幕显式刷成 IDLE（bot_set_state(STATE_IDLE) 因状态未变是空操作，
+     * 不会刷新 OLED，所以这里直接调 oled_show_status 确保开机就显示 STATE: IDLE） */
     audio_out_set_volume(30);
-    bot_set_state(STATE_IDLE);
+    oled_show_status(bot_state_to_str(STATE_IDLE));
 }
 
 /* -------------------------------------------------------------------------

@@ -24,7 +24,7 @@
  * 这样可以避免不同模块之间变量名互相打架。 */
 static const char *TAG = "mic";                 // 本模块日志标签："mic: ..."
 static i2s_chan_handle_t mic_rx_chan = NULL;    // I2S 接收通道句柄（想象成麦克风的遥控器），先置空
-static float g_mic_rms = 0.0f;                   // 最近一次 RMS 值（状态机读取用）
+static volatile float g_mic_rms = 0.0f;          // 最近一次 RMS 值（状态机读取用，volatile 防跨任务优化）
 
 /* -------------------------------------------------------------------------
  * mic_init：打开并配置麦克风（只调用一次）
