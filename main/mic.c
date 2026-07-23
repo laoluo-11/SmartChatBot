@@ -19,12 +19,21 @@
 #include "freertos/FreeRTOS.h"// FreeRTOS 内核
 #include "freertos/task.h"    // 任务函数（xTaskCreate / vTaskDelete / vTaskDelay）
 #include "esp_log.h"          // 日志打印 ESP_LOGI / ESP_LOGE
+#include "esp_heap_caps.h"    // 内存能力分配（采集缓冲放 PSRAM）
 
 /* 模块内部的"私有变量"：static 表示只在 mic.c 里可见，别的文件碰不到。
  * 这样可以避免不同模块之间变量名互相打架。 */
 static const char *TAG = "mic";                 // 本模块日志标签："mic: ..."
 static i2s_chan_handle_t mic_rx_chan = NULL;    // I2S 接收通道句柄（想象成麦克风的遥控器），先置空
 static volatile float g_mic_rms = 0.0f;          // 最近一次 RMS 值（状态机读取用，volatile 防跨任务优化）
+
+/* ---- L7 采集缓冲：LISTENING 期间把 PCM 暂存起来，等 VAD 说完了上传服务器 ----
+ * 放 PSRAM（8MB 够大）：8 秒 * 16000 样本/秒 * 2 字节 ≈ 256KB。 */
+#define CAPTURE_SECONDS  8
+static int16_t *g_cap_buf = NULL;   // 采集缓冲（PSRAM）
+static size_t   g_cap_max = 0;      // 缓冲能装多少个样本
+static size_t   g_cap_len = 0;      // 已经装了多少个样本
+static bool     g_capture_on = false;
 
 /* -------------------------------------------------------------------------
  * mic_init：打开并配置麦克风（只调用一次）
@@ -113,6 +122,16 @@ void mic_task(void *pvParameters)
             float rms = sqrtf((float)((double)sum / samples));  // 平均后再开根号 = RMS
             g_mic_rms = rms;  // 更新全局 RMS 供状态机读取
 
+            /* ---- L7：采集缓冲 ----
+             * 开启采集后，把这段 PCM 顺序写进 g_cap_buf（满了就不再写，丢最旧的）。
+             * 写在这里是因为 mic_task 是唯一持续读麦克风的地方，且单写者、无并发。 */
+            if (g_capture_on && g_cap_buf && g_cap_len < g_cap_max) {
+                size_t room = g_cap_max - g_cap_len;
+                size_t to_copy = (room < (size_t)samples) ? room : (size_t)samples;
+                memcpy(g_cap_buf + g_cap_len, buf, to_copy * sizeof(int16_t));
+                g_cap_len += to_copy;
+            }
+
             /* --- 大约每 1 秒打印一次音量仪表（即使安静也打印，方便你观察对比）---
              * 512 样本 @16kHz 只够 32 毫秒，循环很快；数 32 次循环（≈1秒）才打一行，不刷屏。
              *
@@ -132,4 +151,36 @@ void mic_task(void *pvParameters)
 float mic_get_rms(void)
 {
     return g_mic_rms;
+}
+
+/* ---- L7 采集缓冲接口实现 ---- */
+void mic_capture_start(void)
+{
+    if (g_cap_buf == NULL) {
+        g_cap_max = CAPTURE_SECONDS * SAMPLE_RATE;   // 总样本数
+        /* 优先放 PSRAM（256KB 不小），失败再退到内部 SRAM */
+        g_cap_buf = (int16_t *)heap_caps_malloc(g_cap_max * sizeof(int16_t),
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!g_cap_buf) {
+            g_cap_buf = (int16_t *)malloc(g_cap_max * sizeof(int16_t));
+        }
+    }
+    if (!g_cap_buf) {
+        ESP_LOGE(TAG, "采集缓冲分配失败，无法录音上传");
+        return;
+    }
+    g_cap_len = 0;       // 从头记
+    g_capture_on = true;
+    ESP_LOGI(TAG, "开始采集（最多 %d 秒）", CAPTURE_SECONDS);
+}
+
+void mic_capture_stop(void)
+{
+    g_capture_on = false;   // 缓冲定格，可被读取
+}
+
+const int16_t *mic_capture_get(size_t *samples)
+{
+    *samples = g_cap_len;
+    return g_cap_buf;
 }

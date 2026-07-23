@@ -29,4 +29,16 @@ void mic_task(void *pvParameters);
 /* 获取最近一次 RMS 音量值（状态机用此判断有无声音） */
 float mic_get_rms(void);
 
+/* ---- L7 新增：采集缓冲（LISTENING 期间把 PCM 暂存，供上传服务器）---- */
+/* 开始采集：从这一刻起把麦克风 PCM 存进缓冲（最多 CAPTURE_SECONDS 秒）。
+ * 重复调用会重置缓冲、从头记。 */
+void mic_capture_start(void);
+
+/* 停止采集：缓冲定格，可安全读取。 */
+void mic_capture_stop(void);
+
+/* 取出已采集的 PCM（samples 个 int16 样本）。返回的指针在下次 mic_capture_start 前有效。
+ * 返回 NULL 表示没采到东西。 */
+const int16_t *mic_capture_get(size_t *samples);
+
 #endif /* MIC_H */

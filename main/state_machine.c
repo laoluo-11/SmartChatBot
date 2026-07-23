@@ -4,23 +4,24 @@
  * 它干三件事：
  *   1) 记住"现在在哪个状态"（g_state）
  *   2) bot_set_state() 切状态时，自动把 OLED 屏幕更新成 STATE: xxx
- *   3) 同时把板载 RGB 灯设成对应颜色；进入 SPEAKING 时额外播一声测试音
+ *   3) 同时把板载 RGB 灯设成对应颜色
  *
- * bot_state_task 是新增的自动推进任务：
+ * bot_state_task 是自动推进任务：
  *   IDLE:      什么都不做，等按键唤醒
- *   LISTENING: 监听麦克风 → 检测到声音后再静音 → 自动 → THINKING
- *   THINKING:  等待 5 秒 → 自动 → SPEAKING
- *   SPEAKING:  等待 3 秒（喇叭播正弦波）→ 自动 → IDLE
+ *   LISTENING: 监听麦克风 → VAD 静音 → 上传音频+audio_end → THINKING（L7）
+ *   THINKING:  等服务器回音频（超时兜底回 IDLE）
+ *   SPEAKING:  由 comm 播放任务触发，播完回调退出（超时强制退出）
  *
- * 设计意图：别处（比如按键回调）只要喊"切到下一个状态"，屏幕/灯/喇叭就都跟上了，
- * 不用在按键代码里又写 OLED、又写 LED、又写喇叭——那会乱。状态机就是那个"中枢"。
+ * 设计意图：别处（比如按键回调）只要喊"切到下一个状态"，屏幕/灯就都跟上了，
+ * 不用在按键代码里又写 OLED、又写 LED——那会乱。状态机就是那个"中枢"。
  * ========================================================================= */
 
 #include "state_machine.h"
 #include "oled.h"        // oled_show_status()：把状态名打到屏幕
 #include "led.h"         // led_set_color() / led_off()：板载 RGB 灯
 #include "audio_out.h"   // audio_out_play_tone()：SPEAKING 时播测试音
-#include "mic.h"         // mic_get_rms()：读取当前麦克风音量
+#include "mic.h"         // mic_get_rms() / 采集缓冲
+#include "comm.h"        // L7：comm_send_audio_frames / comm_send_json / comm_is_connected
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,12 +32,19 @@ static const char *TAG = "state";   // 日志标签："state: ..."
 /* 当前状态。开机默认空闲，等用户按键。 */
 static bot_state_t g_state = STATE_IDLE;
 
+/* SPEAKING 进入时刻（毫秒）：用于超时兜底，防止因服务器没发 audio_end 而卡死 */
+static uint32_t g_spk_start_ms = 0;
+
 /* 静音检测阈值：RMS 低于此值认为"没在说话" */
 #define SILENCE_THRESHOLD   200.0f
 /* 静音持续多久（毫秒）才确认用户说完了，自动切到 THINKING */
 #define SILENCE_TIMEOUT_MS  1500
 /* LISTENING 最长等多久（毫秒），超时还没人说话就退回 IDLE */
 #define LISTEN_MAX_MS       8000
+/* THINKING 最多等多久（毫秒）：等服务器回音频，超时没回就回 IDLE（离线兜底前的保护） */
+#define THINK_TIMEOUT_MS    20000
+/* SPEAKING 最多播多久（毫秒）：即使服务器没发 audio_end，到点也强制回 IDLE，防卡死 */
+#define SPEAK_MAX_MS        30000
 
 /* 状态名查表：枚举 -> 字符串（给 OLED 显示） */
 const char *bot_state_to_str(bot_state_t s)
@@ -69,8 +77,21 @@ void bot_set_state(bot_state_t new_state)
     if (new_state >= STATE_COUNT) return;     // 防御：非法状态直接忽略
     if (new_state == g_state) return;         // 同状态不重复处理（避免重复播声音等副作用）
 
+    bot_state_t old = g_state;                // 记下旧状态，下面管采集缓冲要用
     g_state = new_state;
     const char *name = bot_state_to_str(new_state);
+
+    /* L7：进入/离开 LISTENING 时管理采集缓冲。
+     * 进 LISTENING 开录；离开 LISTENING（去 THINKING/IDLE 等）停录。 */
+    if (new_state == STATE_LISTENING) {
+        mic_capture_start();
+    } else if (old == STATE_LISTENING) {
+        mic_capture_stop();
+    }
+    /* 进入 SPEAKING：记下时刻，用于超时兜底 */
+    if (new_state == STATE_SPEAKING) {
+        g_spk_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    }
     ESP_LOGI(TAG, "状态切换 -> %s", name);
 
     /* 1) 屏幕：显示 STATE: / 状态名（oled_show_status 内部已清屏+刷新） */
@@ -131,8 +152,23 @@ void bot_state_task(void *pvParameters)
                 if (silence_start == 0) {
                     silence_start = now;
                 } else if (now - silence_start >= SILENCE_TIMEOUT_MS) {
-                    ESP_LOGI(TAG, "LISTENING: 静音 %.0f ms → 进入 THINKING",
+                    ESP_LOGI(TAG, "LISTENING: 静音 %.0f ms → 说完了，上传音频",
                              (float)(now - silence_start));
+
+                    /* L7：把这段录音上传给服务器（切片→Opus→逐帧发） */
+                    mic_capture_stop();                 // 缓冲定格
+                    size_t nsamp = 0;
+                    const int16_t *cap = mic_capture_get(&nsamp);
+                    if (cap && nsamp > 0) {
+                        if (comm_is_connected()) {
+                            comm_send_audio_frames(cap, nsamp);
+                            comm_send_json("{\"type\":\"audio_end\"}");  // 告诉服务器：这段说完了
+                            oled_show_lines("你说完", "了，等回复", NULL, NULL);
+                        } else {
+                            ESP_LOGW(TAG, "未连服务器，录音已丢弃（%u 样本）", (unsigned)nsamp);
+                        }
+                    }
+
                     sound_detected = false;
                     silence_start = 0;
                     listen_start = 0;
@@ -153,17 +189,37 @@ void bot_state_task(void *pvParameters)
             break;
         }
 
-        case STATE_THINKING:
-            ESP_LOGI(TAG, "THINKING: 思考中（5 秒）...");
-            vTaskDelay(pdMS_TO_TICKS(5000));
-            bot_set_state(STATE_SPEAKING);
+        case STATE_THINKING: {
+            /* L7：不再傻等 5 秒，而是"等服务器回音频"。
+             * 服务器一开始下发音频，comm 的播放任务会调 on_play_start → bot_set_state(SPEAKING)，
+             * 本分支检测到状态变了就退出；超过 THINK_TIMEOUT_MS 还没回（服务器挂了/没网），
+             * 就退回 IDLE（后续可接 OFFLINE 离线兜底）。 */
+            ESP_LOGI(TAG, "THINKING: 等待服务器回复...");
+            uint32_t t0 = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            while (bot_get_state() == STATE_THINKING) {
+                if (xTaskGetTickCount() * portTICK_PERIOD_MS - t0 > THINK_TIMEOUT_MS) {
+                    ESP_LOGW(TAG, "THINKING: %d ms 无回复 → 退回 IDLE", THINK_TIMEOUT_MS);
+                    bot_set_state(STATE_IDLE);
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
             break;
+        }
 
-        case STATE_SPEAKING:
-            ESP_LOGI(TAG, "SPEAKING: 播放中（3 秒）...");
-            audio_out_play_tone(1000, 3000);
-            bot_set_state(STATE_IDLE);
+        case STATE_SPEAKING: {
+            /* L7：进入 SPEAKING 表示"服务器音频正在播放"（由 comm 播放任务触发）。
+             * 真正回到 IDLE 由播放结束回调决定；这里只是兜底：超过 SPEAK_MAX_MS 强制回 IDLE，
+             * 防止服务器没发 audio_end 导致永远卡在 SPEAKING。
+             * 进入时刻 g_spk_start_ms 已在 bot_set_state 里记好。 */
+            if (xTaskGetTickCount() * portTICK_PERIOD_MS - g_spk_start_ms > SPEAK_MAX_MS) {
+                ESP_LOGW(TAG, "SPEAKING: 超时 %d ms → 强制回 IDLE", SPEAK_MAX_MS);
+                bot_set_state(STATE_IDLE);
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
             break;
+        }
 
         default:
             /* IDLE 或其他未知状态：什么也不做，睡一会儿再查 */

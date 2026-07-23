@@ -136,3 +136,62 @@ void audio_out_set_volume(int vol)
 int  audio_out_get_volume(void) { return g_volume; }
 void audio_out_volume_up(void)   { audio_out_set_volume(g_volume + 10); }
 void audio_out_volume_down(void) { audio_out_set_volume(g_volume - 10); }
+
+/* -------------------------------------------------------------------------
+ * L7 流式 PCM 播放：一段语音只开关一次 I2S，避免逐帧爆音
+ * ------------------------------------------------------------------------- */
+esp_err_t audio_out_stream_begin(void)
+{
+    if (s_audio_mutex == NULL || spk_tx_chan == NULL) {
+        ESP_LOGE(TAG, "喇叭未就绪");
+        return ESP_FAIL;
+    }
+    if (xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "获取互斥锁超时");
+        return ESP_FAIL;
+    }
+    esp_err_t err = i2s_channel_enable(spk_tx_chan);
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_audio_mutex);
+        ESP_LOGE(TAG, "I2S 使能失败 %d", err);
+        return err;
+    }
+    return ESP_OK;
+}
+
+esp_err_t audio_out_play_pcm(const int16_t *pcm, size_t samples)
+{
+    if (spk_tx_chan == NULL || pcm == NULL || samples == 0) return ESP_FAIL;
+    if (s_audio_mutex == NULL) return ESP_FAIL;   // 必须先 stream_begin 拿到锁
+
+    int vol = g_volume;
+    size_t offset = 0;
+    /* 分块写，单块不超过 4K 样本，防止一次 i2s_channel_write 过大阻塞 */
+    while (offset < samples) {
+        size_t chunk = samples - offset;
+        if (chunk > 4096) chunk = 4096;
+        int16_t tmp[4096];
+        for (size_t i = 0; i < chunk; i++) {
+            int32_t s = (int32_t)pcm[offset + i] * vol / 100;   // 按当前音量缩放
+            if (s > 32767) s = 32767;
+            if (s < -32768) s = -32768;
+            tmp[i] = (int16_t)s;
+        }
+        size_t written = 0;
+        esp_err_t err = i2s_channel_write(spk_tx_chan, tmp, chunk * sizeof(int16_t),
+                                          &written, pdMS_TO_TICKS(2000));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "audio_out_play_pcm 写入失败 @%d: %d", (int)offset, err);
+            break;
+        }
+        offset += written / sizeof(int16_t);
+    }
+    return ESP_OK;
+}
+
+esp_err_t audio_out_stream_end(void)
+{
+    if (spk_tx_chan) i2s_channel_disable(spk_tx_chan);
+    if (s_audio_mutex) xSemaphoreGive(s_audio_mutex);
+    return ESP_OK;
+}

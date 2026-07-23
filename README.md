@@ -16,8 +16,9 @@
 | **L3** | 喇叭播放 (MAX98357A I2S OUT) | 播放测试音 | ✅ 通关 |
 | **L4** | OLED 显示 (SSD1306 I2C) | 状态/音量/RSSI | ✅ 通关 |
 | **L5** | 按键 + 状态机骨架 | IDLE/LISTENING/... 态切换 | ✅ 通关 |
-| **L6** | WiFi + NVS + SoftAP 配网 | 配网持久化 + SoftAP 网页配网 | 🔵 当前关 |
-| **L7** | WebSocket 通信 + Opus 框架 | 上行音频/下行文本 | ⏳ |
+| **L6** | WiFi + NVS + SoftAP 配网 | 配网持久化 + SoftAP 网页配网 | ✅ 通关 |
+| **L7** | WebSocket 通信 + Opus 框架 | 上行音频/下行文本（真·收发语音） | 🔵 当前关 |
+| **L8** | 唤醒词 (wakenet) | 离线唤醒 + 打断 | ⏳ |
 | **L8** | 唤醒词 (wakenet) | 离线唤醒 + 打断 | ⏳ |
 | **L9** | 离线兜底 (multinet) | 断网本地命令模式 | ⏳ |
 | **L10** | 调试台 + OTA | Web 遥测 / 固件升级 | ⏳ |
@@ -370,3 +371,103 @@ idf.py -p COM3 flash monitor     # COM3 换成你的端口
 
 过完 L6，在对话里回我「**L6 过了**」或贴出监视器日志（含 `已连上 WiFi，IP=`），我接着给
 **L7 WebSocket 通信 + Opus 框架**（真正把语音/文本送到服务器）。
+
+---
+
+## L7 · WebSocket 通信 + Opus 框架（本关交付）
+
+在 L6 联网基础上，把"语音真正送到服务器、服务器回的语音真正播出来"这件事搭成框架。
+核心三件事：**建立 WebSocket 长连接**、**上行把录音切成 Opus 帧发出去**、**下行把服务器音频
+解码后经喇叭播放**。协议沿用整体方案文档（voice-chatbot-architecture.md 第 5 节）。
+
+### 这一关新增 / 变更了什么
+
+- **新增 `comm.h` / `comm.c`**：WebSocket 客户端（基于 `esp_websocket_client`）。
+  - `comm_init(uri, ctrl_cb)`：建客户端 + 注册"收到服务器 JSON"回调。
+  - `comm_connect()`：连服务器（在 `on_wifi_connected` 里触发，连上 WiFi 才连）。
+  - `comm_send_audio_frames(pcm, samples)`：把一段 PCM 切 20ms 帧 → Opus 编码 → 逐帧发（二进制帧
+    `[1字节 codec]+payload`，codec=0x01 Opus / 0x02 PCM）。
+  - `comm_send_json()`：发控制文本帧（如 `{"type":"audio_end"}`）。
+  - 下行：收到二进制帧入队 → 内部 `playback_task` 解码 → `audio_out` 连续播放；并在
+    "开始播放/播放结束"时回调上层，用来驱动状态机 `SPEAKING ↔ IDLE`。
+- **新增 `opus_codec.h` / `opus_codec.c`**：Opus 编解码封装。
+  - 自动探测是否装了 Espressif 的 `esp-opus-encoder` / `esp-opus-decoder`：装了用真 Opus（省带宽），
+    没装则用 **PCM 透传**兜底（带宽大但能先跑通联调）。装组件命令见下。
+  - `opus_codec_init()` / `opus_encode_frame()` / `opus_decode_packet()`。
+- **改 `mic.c` / `mic.h`**：新增采集缓冲 `mic_capture_start/stop/get`。进入 `LISTENING` 自动开录，
+  缓冲放 PSRAM（最多 8 秒），VAD 检测到"说完了"后上传。
+- **改 `audio_out.c` / `audio_out.h`**：新增流式播放 `audio_out_stream_begin / play_pcm / stream_end`，
+  一整段语音只开关一次 I2S，避免逐帧开关的爆音/咔哒声。
+- **改 `state_machine.c`**：`LISTENING` 结束 → 上传音频 + `audio_end` → `THINKING`；
+  `THINKING` 改为"等服务器回音频"（超时 20s 退回 IDLE 兜底）；`SPEAKING` 由播放任务触发、
+  播放结束回调退出。
+- **改 `main.c`**：加 `comm.h` / `opus_codec.h`；联网成功后 `comm_connect()`；注册控制/播放回调；
+  启动 `playback_task`。顶部 `SERVER_WS_URI` 改成你服务器（或测试机）的 IP。
+- **改 `CMakeLists.txt`**：`SRCS` 加 `comm.c` `opus_codec.c`；`REQUIRES` 加 `esp_websocket_client`。
+- **新增 `tools/server.py`**：回声测试服务器（见下方"本地联调"），无需真实 ASR/LLM/TTS 即可跑通全链路。
+
+### 本地联调（最快验证 L7 全链路）
+
+需要一台和 ESP32 同 WiFi 的电脑跑测试服务器：
+
+```bash
+pip install websockets
+# 把本机 IP 填进 main.c 的 SERVER_WS_URI，例如 ws://192.168.1.50:8000/bot
+python tools/server.py 8000
+```
+
+测试服务器是"回声"：设备上传的音频会被原样发回，喇叭应原样播放出来（能验证
+采集→编码→上行→下行→解码→播放 整条链路）。日志里应看到：
+
+```
+I (xxx) comm: WebSocket 已连上服务器
+I (xxx) state: LISTENING: 静音 ... → 说完了，上传音频
+I (xxx) comm: 已上传 N 个音频帧（... 样本）
+I (xxx) comm: 服务器音频流结束标记
+```
+
+### 编译 / 烧录 / 监视
+
+```bash
+idf.py reconfigure      # 改过 CMakeLists 的 REQUIRES 后必须重配
+idf.py build
+idf.py -p COM3 flash monitor     # COM3 换成你的端口
+```
+
+### ✅ 验收标准（通关条件）
+
+1. 连上 WiFi + 服务器后日志出现 `comm: WebSocket 已连上服务器`（灯绿 / 屏 ONLINE）。
+2. 按唤醒键说话、停顿 → 日志出现"上传 N 个音频帧"；回声服务器把音频回传，喇叭应播出你刚说的话。
+3. 屏幕在 `LISTENING → THINKING → SPEAKING → IDLE` 间自动切换（不再靠固定 5 秒定时器）。
+4. 若没装 Opus 组件，日志应出现 `opus: 未安装 esp-opus 组件 -> 使用 PCM 透传`，链路仍跑通（带宽大）；
+   装组件后重编，日志变 `Opus 编解码已启用（真 Opus...）`。
+
+### 🐞 常见坑
+
+- **编译报 `Failed to resolve component 'esp_websocket_client'`**：这是 **ESP-IDF v6 的特性**，
+  `esp_websocket_client` 已从核心组件移出、变成「组件管理器里的托管组件」。`REQUIRES` 里写它不够，
+  还必须在 `main/idf_component.yml` 里声明依赖（本工程已加好
+  `espressif/esp_websocket_client: '*'`，与 `led_strip: '*'` 同风格），然后 `idf.py reconfigure` 让它联网拉取下来即可。
+  注意：**不要锁死 `^1.8.0`** 这类窄区间——1.8.0 是刚发布的新版，对 IDF 6.0.2 可能不兼容，
+  组件管理器会报 `no versions match ^1.8.0`。用 `*` 让管理器自动挑「对当前 IDF 兼容的最高版本」最稳。
+  同理，`led_strip`、`esp-opus-encoder/decoder` 在 v6 也都是托管组件，靠 `idf_component.yml` 引入。
+- **装了 Opus 组件却编译报参数不匹配**：以你机器上
+  `managed_components/espressif__esp-opus-*/include/esp_opus_encoder.h` 的真实声明为准，
+  微调 `opus_codec.c` 里 `esp_opus_encoder_process` / `esp_opus_decoder_process` 的参数（注释已标注）。
+- **连不上服务器**：① `SERVER_WS_URI` 的 IP 必须是设备能 ping 通的（同一 WiFi、关掉电脑防火墙）；
+  ② 设备连的是家里 WiFi，服务器 IP 应是该 WiFi 下电脑的 IP（不是 `192.168.4.1`，那是配网热点）；
+  ③ `ws://` 不用证书；要 `wss://` 需额外配 esp-tls 证书。
+- **回声有卡顿/丢帧**：播放队列满会丢最旧帧（代码有意如此防卡死）；真服务器应做抖动缓冲 + 背压。
+- **想装真 Opus 省带宽**：
+  ```bash
+  idf.py add-dependency "espressif/esp-opus-encoder"
+  idf.py add-dependency "espressif/esp-opus-decoder"
+  idf.py reconfigure && idf.py build
+  ```
+  若重编后日志仍是 "使用 PCM 透传"（即 `USE_OPUS` 没自动变成 1），多半是这两个组件没进
+  `main/CMakeLists.txt` 的 `REQUIRES`，手动补上 `esp-opus-encoder esp-opus-decoder` 再重编即可。
+
+---
+
+过完 L7，在对话里回我「**L7 过了**」或贴出监视器日志（含 `WebSocket 已连上服务器` + `已上传 N 个音频帧`），
+我接着给 **L8 唤醒词 (wakenet)**（离线唤醒 + 打断，不再需要按唤醒键）。

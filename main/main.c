@@ -1,28 +1,26 @@
 /* =========================================================================
- * main.c —— 程序入口（L5 按键+状态机 + L6 WiFi/NVS/SoftAP 配网）
+ * main.c —— 程序入口（L5 按键+状态机 + L6 WiFi + L7 WebSocket/Opus 通信）
  * -------------------------------------------------------------------------
  * 现在各硬件模块各司其职：
- *   - mic.c           ：麦克风采集（打印 RMS 音量，做"系统还活着"的指示）
- *   - audio_out.c     ：喇叭（audio_out_play_tone 播测试音）
- *   - oled.c          ：OLED（oled_show_status 显示状态，oled_draw_text 写任意字）
- *   - led.c           ：板载 RGB（led_set_color 按状态变色）
- *   - state_machine.c ：状态机（中枢：切状态时自动驱动 OLED + LED）
- *   - button.c        ：按键（中断 → 队列 → 任务 → 回调，推进状态机）
- *   - wifi.c          ：WiFi/配网（L6：NVS 存账号、SoftAP 热点+网页配网、STA 连家里）
+ *   - mic.c           ：麦克风采集（RMS 音量 + L7 采集缓冲供上传）
+ *   - audio_out.c     ：喇叭（测试音 + L7 流式 PCM 播放）
+ *   - oled.c          ：OLED（状态/文本显示）
+ *   - led.c           ：板载 RGB（按状态变色）
+ *   - state_machine.c ：状态机（中枢：切状态自动驱动 OLED + LED；L7 由服务器事件驱动）
+ *   - button.c        ：按键（中断 → 队列 → 任务 → 回调）
+ *   - wifi.c          ：WiFi/配网（NVS 存账号、SoftAP 热点+网页配网、STA 连家里）
+ *   - comm.c          ：L7 WebSocket 通信（上行音频/下行音频+文本，接收端解码播放）
+ *   - opus_codec.c    ：L7 Opus 编解码（未装组件时 PCM 透传兜底）
  *
- * L5 对话流程（一键触发全自动）：
- *   按键1 (GPIO0  唤醒) → 进入 LISTENING → 等用户说话 → 静音后 → THINKING（5秒）
- *                      → SPEAKING（喇叭播 3 秒正弦波）→ 自动回 IDLE
- *   按键2 (GPIO39 音量-) → 喇叭音量 -10，屏幕显示 VOL xx%
- *   按键3 (GPIO40 音量+) → 喇叭音量 +10，屏幕显示 VOL xx%
- *
- * L6 联网流程（开机自动）：
- *   有存档账号 → STA 直连家里 WiFi（屏幕 CONNECTING → ONLINE）
- *   无存档账号 → ESP32 变热点(ESP32-Chatbot) + 网页，手机填账号后存 NVS 并切 STA
- * 喇叭只在 SPEAKING 状态才发声，其他时候静音。
+ * L7 对话流程（真正收发语音）：
+ *   按键1 (GPIO0 唤醒) → LISTENING（开录）→ VAD 静音→上传音频+audio_end → THINKING
+ *   → 服务器回音频 → SPEAKING（解码播放）→ 播放完 → IDLE
+ *   按键2/3：音量 -/+
+ * L6 联网：有存档直连 / 无存档进配网；连上后 on_wifi_connected 触发 comm_connect 连服务器。
  * ========================================================================= */
 
 #include <stdio.h>              // 标准输入输出（习惯带上）
+#include <string.h>             // strstr（解析服务器 JSON 控制帧用）
 #include "freertos/FreeRTOS.h" // FreeRTOS 内核
 #include "freertos/task.h"     // 任务创建 xTaskCreate / 延时 vTaskDelay
 #include "esp_err.h"
@@ -35,8 +33,15 @@
 #include "state_machine.h"     // 状态机（bot_init / bot_set_state / bot_get_state / bot_state_to_str / bot_state_task）
 #include "button.h"            // 按键模块（button_init / button_task / button_register_callback）
 #include "wifi.h"              // WiFi / NVS / SoftAP 配网（L6 新增）
+#include "comm.h"              // L7：WebSocket 通信（comm_init / 连接 / 发送 / 播放任务）
+#include "opus_codec.h"        // L7：Opus 编解码（opus_codec_init）
 
 static const char *TAG = "main";  // 本文件日志标签："main: ..."（入口相关的日志归这里）
+
+/* L7：服务器 WebSocket 地址。把这里改成你运行 tools/server.py（或正式服务器）的机器 IP。
+ * 例如你电脑连同一 WiFi、IP 是 192.168.1.50，就写 "ws://192.168.1.50:8000/bot"。
+ * 用 wss:// 可加密（需额外配证书/esp-tls），本地联调先用 ws:// 即可。 */
+#define SERVER_WS_URI  "ws://192.168.4.1:8000/bot"
 
 /* -------------------------------------------------------------------------
  * show_volume：把当前音量打到 OLED（音量键调完顺手看一下）
@@ -75,13 +80,56 @@ static void on_button_pressed(button_action_t action)
 
 /* -------------------------------------------------------------------------
  * on_wifi_connected：WiFi 真正连上（拿到 IP）时的回调。
- * 由 wifi 模块在事件里异步调用，用来把 OLED/LED 显示成"在线"。
+ * 由 wifi 模块在事件里异步调用，用来把 OLED/LED 显示成"在线"，
+ * 并顺手去连语音服务器（L7）。
  * ------------------------------------------------------------------------- */
 static void on_wifi_connected(void)
 {
     ESP_LOGI(TAG, "WiFi 已连上，机器人进入在线状态");
     oled_show_status("ONLINE");          // 屏幕显示 ONLINE
     led_set_color(0, 255, 80);           // 绿灯：在线
+    comm_connect();                       // L7：连语音服务器
+}
+
+/* WebSocket 真正连上服务器时的回调（只更新显示，绝不再调 comm_connect，避免回环） */
+static void on_comm_connected(void)
+{
+    ESP_LOGI(TAG, "已连上语音服务器，可以开始对话");
+    oled_show_status("ONLINE");
+    led_set_color(0, 255, 80);
+}
+
+/* -------------------------------------------------------------------------
+ * on_comm_ctrl：收到服务器 JSON 控制帧（L7）
+ * 目前认两种字段：
+ *   "transcript" ：用户说的话（ASR 结果）→ 屏幕显示
+ *   "reply"      ：机器人的回复文本（LLM 结果）→ 屏幕显示
+ *   含 "audio_end" ：服务器这轮音频发完 → 通知播放任务收尾
+ * ------------------------------------------------------------------------- */
+static void on_comm_ctrl(const char *json)
+{
+    char buf[48];
+    if (comm_json_get_str(json, "transcript", buf, sizeof(buf)) == 0) {
+        oled_show_lines("你说:", buf, NULL, NULL);
+    } else if (comm_json_get_str(json, "reply", buf, sizeof(buf)) == 0) {
+        oled_show_lines("回复:", buf, NULL, NULL);
+    }
+    if (strstr(json, "audio_end") != NULL) {
+        comm_mark_audio_end();            // 标记本轮音频结束，播放任务据此收尾
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * on_play_start / on_play_end：服务器音频"开始播放 / 播放结束"回调（L7）
+ * 用来驱动状态机：开始播 → SPEAKING；播完 → IDLE。
+ * ------------------------------------------------------------------------- */
+static void on_play_start(void)
+{
+    bot_set_state(STATE_SPEAKING);
+}
+static void on_play_end(void)
+{
+    bot_set_state(STATE_IDLE);
 }
 
 /* -------------------------------------------------------------------------
@@ -185,6 +233,18 @@ void app_main(void)
         bot_set_state(STATE_PROVISIONING);   // OLED 显示 PROVISION + 黄灯
         wifi_start_provisioning();
     }
+
+    /* 第三步半+（L7）：初始化 Opus 编解码 + WebSocket 通信。
+     *   - opus_codec_init()：建编码器/解码器（没装组件则 PCM 透传）
+     *   - comm_init()：建 WebSocket 客户端，注册"收到服务器 JSON"回调
+     *   - 注册"连上服务器 / 播放开始 / 播放结束"回调（用来驱动状态机）
+     *   - comm_start_playback_task()：起"接收音频→解码→喇叭"任务
+     * 注意：真正连服务器要等 WiFi 连上（在 on_wifi_connected 里 comm_connect）。 */
+    opus_codec_init();
+    comm_init(SERVER_WS_URI, on_comm_ctrl);
+    comm_register_connected_cb(on_comm_connected);   // 连上服务器：只更新显示
+    comm_register_playback_cbs(on_play_start, on_play_end);
+    comm_start_playback_task();
 
     /* 第四步：注册"按键按下"的回调，并初始化按键（GPIO 中断 + 事件队列）。 */
     button_register_callback(on_button_pressed);

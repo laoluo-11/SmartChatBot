@@ -54,4 +54,17 @@ int  audio_out_get_volume(void);      // 读取当前音量（0~100）
 void audio_out_volume_up(void);       // 音量 +10（封顶 100）
 void audio_out_volume_down(void);     // 音量 -10（到底 0）
 
+/* ---------- L7 新增：流式 PCM 播放（给服务器下发的语音用） ---------- */
+/* 开始一段流式播放：获取互斥锁 + 打开 I2S 喇叭通道。
+ * 之后反复调用 audio_out_play_pcm 推 PCM（自动按当前音量缩放）；
+ * 播完调 audio_out_stream_end 关闭通道 + 释放锁。
+ * 这样一整段语音只开关一次 I2S，避免逐帧开关导致的爆音/咔哒声。 */
+esp_err_t audio_out_stream_begin(void);
+
+/* 播放一段 PCM（samples 个 int16 样本）。必须在 stream_begin 之后调用。 */
+esp_err_t audio_out_play_pcm(const int16_t *pcm, size_t samples);
+
+/* 结束流式播放：关闭 I2S 通道 + 释放互斥锁（与 stream_begin 配对）。 */
+esp_err_t audio_out_stream_end(void);
+
 #endif /* AUDIO_OUT_H */
