@@ -26,9 +26,13 @@
 #include <stddef.h>
 #include "esp_err.h"
 
-/* Opus 编码帧：16kHz 单声道，20ms = 960 个样本（libopus / ESP-ADF 标准帧长） */
+/* 音频帧长：16kHz 单声道，960 个样本 = 60ms（960/16000=0.06s）。
+ * 【勘误】之前注释写 20ms 是错的——"960 样本=20ms"只在 48kHz 下成立；
+ * 16kHz 下 960 样本就是 60ms。这个数字很重要：回声服务器逐帧回传的间隔
+ * 必须按 60ms 走（server.py 的 sleep），否则 3 倍速灌入设备、播放队列
+ * 塞满后"丢最旧帧"，声音被规律性切碎 → 机器人声。 */
 #define OPUS_FRAME_SAMPLES  960
-#define OPUS_FRAME_MS       20
+#define OPUS_FRAME_MS       60
 
 /* 音频帧里第 1 字节的"编解码格式"标识 */
 #define CODEC_OPUS  0x01   // 负载是 Opus 压缩包

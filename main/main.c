@@ -13,7 +13,7 @@
  *   - opus_codec.c    ：L7 Opus 编解码（未装组件时 PCM 透传兜底）
  *
  * L7 对话流程（真正收发语音）：
- *   按键1 (GPIO0 唤醒) → LISTENING（开录）→ VAD 静音→上传音频+audio_end → THINKING
+ *   语音唤醒词(L8) / 按键1 (GPIO0 唤醒) → LISTENING（开录）→ VAD 静音→上传音频+audio_end → THINKING
  *   → 服务器回音频 → SPEAKING（解码播放）→ 播放完 → IDLE
  *   按键2/3：音量 -/+
  * L6 联网：有存档直连 / 无存档进配网；连上后 on_wifi_connected 触发 comm_connect 连服务器。
@@ -35,13 +35,14 @@
 #include "wifi.h"              // WiFi / NVS / SoftAP 配网（L6 新增）
 #include "comm.h"              // L7：WebSocket 通信（comm_init / 连接 / 发送 / 播放任务）
 #include "opus_codec.h"        // L7：Opus 编解码（opus_codec_init）
+#include "wake.h"              // L8：离线唤醒词（wake_init / wake_feed）
 
 static const char *TAG = "main";  // 本文件日志标签："main: ..."（入口相关的日志归这里）
 
 /* L7：服务器 WebSocket 地址。把这里改成你运行 tools/server.py（或正式服务器）的机器 IP。
  * 例如你电脑连同一 WiFi、IP 是 192.168.1.50，就写 "ws://192.168.1.50:8000/bot"。
  * 用 wss:// 可加密（需额外配证书/esp-tls），本地联调先用 ws:// 即可。 */
-#define SERVER_WS_URI  "ws://192.168.4.1:8000/bot"
+#define SERVER_WS_URI  "ws://10.10.10.80:8000/bot"
 
 /* -------------------------------------------------------------------------
  * show_volume：把当前音量打到 OLED（音量键调完顺手看一下）
@@ -91,6 +92,13 @@ static void on_wifi_connected(void)
     comm_connect();                       // L7：连语音服务器
 }
 
+/* 直连失败 N 次后，WiFi 模块自动进配网时回调：把屏幕/灯切到 PROVISIONING。 */
+static void on_wifi_provisioning(void)
+{
+    ESP_LOGI(TAG, "WiFi 直连失败，自动进入配网模式");
+    bot_set_state(STATE_PROVISIONING);   // OLED 显示 PROVISION + 黄灯
+}
+
 /* WebSocket 真正连上服务器时的回调（只更新显示，绝不再调 comm_connect，避免回环） */
 static void on_comm_connected(void)
 {
@@ -125,7 +133,11 @@ static void on_comm_ctrl(const char *json)
  * ------------------------------------------------------------------------- */
 static void on_play_start(void)
 {
-    bot_set_state(STATE_SPEAKING);
+    /* 仅在 THINKING（等待服务器回复）时才切到 SPEAKING。
+     * 保险：防止个别服务器在设备还在上传时就回音频，把状态误抢成 SPEAKING。 */
+    if (bot_get_state() == STATE_THINKING) {
+        bot_set_state(STATE_SPEAKING);
+    }
 }
 static void on_play_end(void)
 {
@@ -187,9 +199,10 @@ static void demo_all_features(void)
 
     ESP_LOGI(TAG, "===== 开机自检完成 =====");
 
-    /* 恢复默认音量 30%，并把开机屏幕显式刷成 IDLE（bot_set_state(STATE_IDLE) 因状态未变是空操作，
+    /* 恢复运行音量 60%（之前误设 30% 会把回声压得太弱，被喇叭本底噪声盖住，像噪音）。
+     * 并把开机屏幕显式刷成 IDLE（bot_set_state(STATE_IDLE) 因状态未变是空操作，
      * 不会刷新 OLED，所以这里直接调 oled_show_status 确保开机就显示 STATE: IDLE） */
-    audio_out_set_volume(30);
+    audio_out_set_volume(60);
     oled_show_status(bot_state_to_str(STATE_IDLE));
 }
 
@@ -215,6 +228,12 @@ void app_main(void)
     mic_init();        // 打开并配置 I2S 麦克风通道
     audio_out_init();  // 打开并配置 I2S 喇叭发送通道
 
+    /* 第三步半（L8）：初始化离线唤醒词（wakenet）。
+     *   - 装了 esp-sr 且 menuconfig 选了模型 → 返回 true，离线唤醒词可用
+     *   - 没装 esp-sr → 返回 false，走"仅按键唤醒"模拟模式（不致命，工程照常跑）
+     * 必须在创建 mic_task 之前调用，这样 mic_task 一启动就能喂音频给 wakenet。 */
+    wake_init();
+
     /* 第三步：初始化状态机（把当前状态设成 IDLE，并刷一次屏幕 + 灭灯） */
     bot_init();
 
@@ -224,6 +243,7 @@ void app_main(void)
      * 无论哪种，连上后 on_wifi_connected 会把屏幕刷成 ONLINE、灯变绿。 */
     wifi_init();
     wifi_register_connected_cb(on_wifi_connected);
+    wifi_register_provisioning_cb(on_wifi_provisioning);  // 直连失败自动进配网时切显示
     if (wifi_has_saved_creds()) {
         ESP_LOGI(TAG, "检测到已保存 WiFi 账号，尝试以 STA 连接...");
         oled_show_status("CONNECTING");
@@ -257,12 +277,15 @@ void app_main(void)
      * 麦克风持续采集（打印 RMS）作为"系统活着"的指示；
      * 状态机任务：自动推进 LISTENING → THINKING → SPEAKING → IDLE；
      * 按键任务等中断事件、消抖、分派动作。 */
-    BaseType_t mic_ok = xTaskCreate(mic_task, "mic", 4096, NULL, 4, NULL);
+    BaseType_t mic_ok = xTaskCreate(mic_task, "mic", 10240, NULL, 4, NULL);
     if (mic_ok != pdPASS) {
         ESP_LOGE(TAG, "麦克风任务创建失败");
     }
 
-    BaseType_t bot_ok = xTaskCreate(bot_state_task, "bot_st", 4096, NULL, 5, NULL);
+    /* bot_state_task 会直接调用 esp_websocket_client_send_bin（网络发送，吃大栈），
+     * 栈太小会溢出并写坏相邻堆里的 websocket 互斥量 -> assert pxQueue->uxItemSize==0。
+     * 故给到 10240。 */
+    BaseType_t bot_ok = xTaskCreate(bot_state_task, "bot_st", 10240, NULL, 5, NULL);
     if (bot_ok != pdPASS) {
         ESP_LOGE(TAG, "状态机任务创建失败");
     }

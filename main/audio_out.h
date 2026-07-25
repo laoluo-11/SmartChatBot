@@ -33,6 +33,13 @@
 #define SPK_DOUT_GPIO    7           // MAX98357A 的 DIN 脚 → ESP32 的 GPIO7（数据，ESP 输出到功放）
 #define SPK_SAMPLE_RATE  16000       // 采样率 16000Hz（和麦克风保持一致，将来 ASR 也吃 16kHz）
 
+/* MAX98357A 关断脚 SD 接的 GPIO（功放静音控制，可选）：
+ *   -1  = 未接 GPIO（功放由硬接线控制，固件不干预，典型为 SD 直接焊 3.3V 常开）。
+ *   其它 = 实际引脚号（如 GPIO_NUM_18）。固件会在"开始播放"拉高(开功放)、
+ *         "播放结束/初始化"拉低(静音)，可彻底消除待机/静音时的电流声。
+ * 前提：硬件上 SD 必须真的接在该 GPIO 而非硬接 3.3V，否则改这里无效。 */
+#define SPK_SD_GPIO  -1
+
 /* 初始化 I2S 喇叭发送通道。必须在 audio_out_play_tone / 创建 audio_out_task 之前调用一次。 */
 void audio_out_init(void);
 

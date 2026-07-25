@@ -8,6 +8,8 @@
  *   3) 没存档就进入"配网模式"：ESP32 自己变成一个 WiFi 热点(SoftAP)，
  *      并起一个网页服务器；手机连上热点、浏览器打开网页、填家里账号，
  *      提交后存进 NVS，ESP32 自动切回 STA 去连家里 WiFi。
+ *   4) 若开机有存档、但连续 N 次连不上家里 WiFi，也会自动退回配网模式
+ *      （开 SoftAP 热点），无需手动擦 NVS，换网络即可自助重配。
  *
  * 这样账号密码既不写死、又能"换网络重新配"，是物联网设备最常见的配网方式。
  * ========================================================================= */
@@ -48,3 +50,10 @@ esp_err_t wifi_start_provisioning(void);
 
 /* 注册"连上 WiFi"回调（可选，传 NULL 取消）。 */
 void wifi_register_connected_cb(wifi_connected_cb_t cb);
+
+/* "需要重新配网"时回调：STA 直连失败 N 次后，自动进配网模式时触发。
+ * main 用它把 OLED/LED 切到 PROVISIONING 状态。可以为 NULL。 */
+typedef void (*wifi_provisioning_cb_t)(void);
+
+/* 注册"需要重新配网"回调（可选，传 NULL 取消）。 */
+void wifi_register_provisioning_cb(wifi_provisioning_cb_t cb);

@@ -17,9 +17,8 @@
 | **L4** | OLED 显示 (SSD1306 I2C) | 状态/音量/RSSI | ✅ 通关 |
 | **L5** | 按键 + 状态机骨架 | IDLE/LISTENING/... 态切换 | ✅ 通关 |
 | **L6** | WiFi + NVS + SoftAP 配网 | 配网持久化 + SoftAP 网页配网 | ✅ 通关 |
-| **L7** | WebSocket 通信 + Opus 框架 | 上行音频/下行文本（真·收发语音） | 🔵 当前关 |
-| **L8** | 唤醒词 (wakenet) | 离线唤醒 + 打断 | ⏳ |
-| **L8** | 唤醒词 (wakenet) | 离线唤醒 + 打断 | ⏳ |
+| **L7** | WebSocket 通信 + Opus 框架 | 上行音频/下行文本（真·收发语音） | ✅ 通关 |
+| **L8** | 唤醒词 (wakenet) | 离线唤醒 + 打断 | 🔵 当前关 |
 | **L9** | 离线兜底 (multinet) | 断网本地命令模式 | ⏳ |
 | **L10** | 调试台 + OTA | Web 遥测 / 固件升级 | ⏳ |
 | **L11** | 全链路联调 | 完整对话跑通 | ⏳ |
@@ -361,11 +360,27 @@ idf.py -p COM3 flash monitor     # COM3 换成你的端口
   ③ 看日志是否 `WiFi 断开，重连中 (x/5)`，5 次后放弃——多半密码错。
 - **手机连上热点却打不开 `192.168.4.1`**：部分手机有"强制门户检测"，会跳到验证页但也能用；
   直接在浏览器地址栏手输 `http://192.168.4.1`。确保手机**没同时开着蜂窝数据**导致流量被分流。
-- **配网后想重新配网**：在串口执行 `idf.py monitor` 时，可复位后按住 GPIO0（唤醒键）上电并不放
-  并不现实；更稳妥的做法是后续加"长按某键清 NVS"。本期可临时用
-  `idf.py erase_flash` 清掉 NVS 重新配（会清掉全部 NVS，包括 WiFi 账号）。
+- **换网络后自动重配（无需手动擦 NVS）**：STA 直连失败 **5 次**后，固件会**自动停止重试并开启
+  SoftAP 热点**（ESP32-Chatbot），OLED 显示 `PROVISION`、灯变黄。手机连上热点、打开 `192.168.4.1`
+  填新 WiFi 即可；提交后存 NVS 并切回 STA，若新账号仍连不上会再次 5 次后回配网，形成闭环。
+  （这一机制在 L8 时应已合入 `wifi.c` 的 `wifi_event_handler` 重连耗尽分支。）
 - **`wifi_init` 里 NVS 初始化失败 `ESP_ERR_NVS_NO_FREE_PAGES`**：代码已自动 `nvs_flash_erase()`
   重建，正常；若反复出现，可能分区表没 NVS 区，检查 `partitions.csv` 是否有 `nvs` 分区。
+
+#### 配网网页增强：自动扫描附近 WiFi（2026-07-25 追加）
+
+原来配网页要**手动敲 SSID**。现已改为**打开网页自动扫描**周围 WiFi，把搜到的网络名做成下拉建议，
+点选即可，不用手输：
+
+- 新增 HTTP 接口 **`GET /api/scan`**：ESP32 在配网（APSTA）模式下主动 `esp_wifi_scan_start()`
+  扫描，**去重 + 按信号强度排序**后，把结果写成 JSON 返回：
+  `{"count":N,"aps":[{"ssid":"...","rssi":-45,"auth":3,"ch":6}, ...]}`。
+  `auth` 是加密方式枚举（`0`=开放，前端据此标"（开放）"）；`rssi` 用来画信号格。
+- 网页 `<input list='netlist'>` + `<datalist>`：页面加载即 `fetch('/api/scan')` 填充下拉，
+  既能**点选**也能**手动输入**（扫描失败/找不到时仍可手填），并有「刷新」按钮重新扫描。
+- 表单解析 `parse_form_value` 升级为完整 **URL 解码**（`%XX`→字节、`+`→空格），中文 SSID 也能正确入库。
+
+> 注：扫描是在 APSTA 模式下由 STA 接口做的，对手机连热点基本无感；若周围 WiFi 很多，列表最多显示 20 个（信号强的优先）。
 
 ---
 
@@ -469,5 +484,84 @@ idf.py -p COM3 flash monitor     # COM3 换成你的端口
 
 ---
 
-过完 L7，在对话里回我「**L7 过了**」或贴出监视器日志（含 `WebSocket 已连上服务器` + `已上传 N 个音频帧`），
-我接着给 **L8 唤醒词 (wakenet)**（离线唤醒 + 打断，不再需要按唤醒键）。
+---
+
+## L8 · 离线唤醒词 wakenet（本关交付）
+
+在 L7 基础上，让你「说一句唤醒词」就能开始对话，不再需要按唤醒键（按键仍保留作打断 / 音量，优先级最高）。
+
+### 这一关新增 / 变更了什么
+
+- **新增 `wake.h` / `wake.c`**：wakenet 封装模块。用 `#if __has_include("wakenet.h")` 做**编译期探测**：
+  - **装了 esp-sr**（且在 `menuconfig` 选了 WakeNet 模型）→ 走【真·离线唤醒词】，神经网络检测唤醒词；
+  - **没装 esp-sr** → 走【模拟模式】：`wake_feed()` 永远返回 false，工程照样能编译、运行（只是不能语音
+    唤醒，只能按唤醒键）。这样无论装不装组件，工程都能编过，想体验真唤醒词按下方三步启用即可。
+- **改 `mic.c`**：`mic_task` 在主循环里算完 RMS 后，**当当前状态是 `IDLE` 时**，把这段 PCM 喂给 `wake_feed()`；
+  检测到唤醒词 → `bot_set_state(STATE_LISTENING)`，和按唤醒键效果完全相同。
+- **改 `main.c`**：加 `#include "wake.h"`，在 `mic_init()` 后调 `wake_init()`（失败不致命，模拟模式照常跑）。
+- **改 `CMakeLists.txt`**：`SRCS` 加 `wake.c`（esp-sr 靠探测模式引入，不强制写进 `REQUIRES`）。
+
+### 两种运行模式
+
+1. **模拟模式（默认，没装 esp-sr）**：工程照常编译、按键唤醒正常（L7 功能不退化）。日志会看到
+   `wake: 未安装 esp-sr 组件 → 离线唤醒词不可用，仅按键唤醒（模拟模式）`。
+2. **真·离线唤醒词（装 esp-sr）**：见下方「启用真唤醒词」。
+
+### 启用真唤醒词（三步）
+
+```bash
+idf.py add-dependency "espressif/esp-sr"   # 写入 idf_component.yml，自动加入 REQUIRES
+```
+
+1. `idf.py menuconfig` → **ESP Speech Recognition** → **WakeNet** 选一个模型
+   （如 `wn9_hilexin` = 你好小智；选中后记住模型名）。
+2. `partitions.csv` 加 `model` 分区（模型要烧进 flash；大小按所选模型，建议 ≥4000K）：
+   ```
+   model, data, model, , 4000K,
+   ```
+   并在菜单 **Partition Table** → 选 **Custom partition CSV** 指向你的 `partitions.csv`。
+3. `idf.py reconfigure && idf.py build && idf.py flash monitor`
+   （`flash` 会把选中的模型自动烧录到 `model` 分区）。
+
+> ⚠️ `wake.c` 里的 `WAKE_WORD_MODEL_NAME` 默认值 `"wn9_hilexin"` **必须和你在 menuconfig 选的模型名一致**；
+> 选了别的（如 `wn9_hiesp`=Hi ESP）就把这个字符串改掉。
+
+### 编译 / 烧录 / 监视
+
+```bash
+idf.py reconfigure      # 改过 CMakeLists / 加了依赖后必须重配
+idf.py build
+idf.py -p COM3 flash monitor     # COM3 换成你的端口
+```
+
+### ✅ 验收标准（通关条件）
+
+1. **模拟模式**：编译通过，按唤醒键（GPIO0）仍能正常开始对话，L7 功能不退化。
+2. **真模式**（装 esp-sr + 选模型 + 烧录）：对着板子说唤醒词，监视器出现
+   ```
+   I (xxx) wake: WAKENET: 检测到唤醒词 → 进入 LISTENING
+   ```
+   OLED 自动变 `STATE: LISTENING`、灯变蓝，**无需按键**即开始一轮对话（后续 VAD 静音 → 上传 → 服务器回答 → 播放）。
+
+### 🐞 常见坑
+
+- **编译报找不到 `wakenet.h`**：说明 esp-sr 没拉下来，确认 `add-dependency` 后已 `idf.py reconfigure`。
+- **wakenet API 不匹配（参类型报错）**：esp-sr 的 v2 / v3 的 `wakenet_init` / `wakenet_detect` 签名不同
+  （就像 L7 的 `esp_websocket_client`）。请以你机器上
+  `managed_components/espressif__esp-sr/include/wakenet.h` 的真实声明为准，按 `wake.c` 里注释标注的
+  那 2~3 行微调即可（和 L7 改 opus / websocket 同理）。
+- **报 model 分区 / 找不到模型**：`partitions.csv` 没加 `model` 分区，或 menuconfig 没选 WakeNet，或
+  `WAKE_WORD_MODEL_NAME` 与所选模型名不一致。
+- **误唤醒 / 自唤醒**：机器人播放（TTS）时若没有 AEC，可能录到自己声音触发唤醒。L8 只在 `IDLE` 响应唤醒词，
+  天然规避大部分；完整 AEC 打断是后续优化点（见下）。
+
+### 打断（后续优化）
+
+架构文档要求 `SPEAKING` 期间说唤醒词可「打断」回到 `LISTENING`。本期唤醒词**仅在 IDLE 触发**；
+`SPEAKING` 时的打断仍靠按唤醒键（按键回调已支持任意状态切入 LISTENING）。真·语音打断需给 wakenet
+接 AEC 参考（把喇叭正在播放的 PCM 也喂进去抵消回声），留待后续关卡。
+
+---
+
+过完 L8，在对话里回我「**L8 过了**」或贴出监视器日志（含 `WAKENET: 检测到唤醒词` 或 `未安装 esp-sr` 两选一），
+我接着给 **L9 离线兜底 (multinet)**（断网时本地命令词模式）。

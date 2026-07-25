@@ -1,0 +1,8 @@
+# ESP32-S3 N16R8 (16MB Flash) 自定义分区表
+# 为 esp-sr 离线语音（WakeNet/MultiNet）新增 model 分区存放神经网络模型。
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  0x400000,
+model,      data, spiffs,  ,         0x400000,
+storage,    data, spiffs,  ,         0x100000,

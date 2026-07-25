@@ -35,12 +35,16 @@ static bot_state_t g_state = STATE_IDLE;
 /* SPEAKING 进入时刻（毫秒）：用于超时兜底，防止因服务器没发 audio_end 而卡死 */
 static uint32_t g_spk_start_ms = 0;
 
-/* 静音检测阈值：RMS 低于此值认为"没在说话" */
-#define SILENCE_THRESHOLD   200.0f
+/* 静音检测阈值：RMS 低于此值认为"没在说话"。
+ * 录音用 32bit>>16 取标准 16bit 真值：安静时 RMS 仅几，正常说话 RMS 几百~上千，
+ * 阈值 80 能清晰区分"说/没说"。若改了录音方式导致"一直有声音"或"检测不到说话"，回头调这里。 */
+#define SILENCE_THRESHOLD   80.0f
 /* 静音持续多久（毫秒）才确认用户说完了，自动切到 THINKING */
 #define SILENCE_TIMEOUT_MS  1500
 /* LISTENING 最长等多久（毫秒），超时还没人说话就退回 IDLE */
 #define LISTEN_MAX_MS       8000
+/* LISTENING 单次说话最长多久（毫秒）：防止一直说不停导致连接/服务端超限，到点强制结束 */
+#define LISTEN_SPEAK_MAX_MS 30000
 /* THINKING 最多等多久（毫秒）：等服务器回音频，超时没回就回 IDLE（离线兜底前的保护） */
 #define THINK_TIMEOUT_MS    20000
 /* SPEAKING 最多播多久（毫秒）：即使服务器没发 audio_end，到点也强制回 IDLE，防卡死 */
@@ -122,6 +126,7 @@ void bot_state_task(void *pvParameters)
     bool sound_detected = false;       // 是否已检测到有人说话
     uint32_t silence_start = 0;       // 静音开始的时间戳
     uint32_t listen_start = 0;        // 进入 LISTENING 的时间戳
+    uint32_t speak_start = 0;         // 首次出声的时刻（说话最长时限用）
 
     while (1) {
         bot_state_t cur = bot_get_state();
@@ -129,8 +134,7 @@ void bot_state_task(void *pvParameters)
         switch (cur) {
 
         case STATE_LISTENING: {
-            /* 记录首次进入 LISTENING 的时刻 */
-            if (!sound_detected && listen_start == 0) {
+            if (listen_start == 0) {
                 listen_start = xTaskGetTickCount() * portTICK_PERIOD_MS;
                 ESP_LOGI(TAG, "LISTENING: 开始监听...");
             }
@@ -138,43 +142,42 @@ void bot_state_task(void *pvParameters)
             float rms = mic_get_rms();
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-            /* 检测到声音：RMS 超过阈值 */
+            /* 检测到声音：RMS 超过阈值 → 记首次出声时刻（用于说话最长时限） */
             if (rms > SILENCE_THRESHOLD) {
                 if (!sound_detected) {
                     sound_detected = true;
+                    speak_start = now;
                     ESP_LOGI(TAG, "LISTENING: 检测到声音 (RMS=%.0f)", rms);
                 }
                 silence_start = 0;  // 还在说话，重置静音计时
             }
 
-            /* 检测到声音后，开始计静音时长 */
+            /* 判定"说完了"：要么静音超时，要么单次说话达上限 */
+            bool done = false;
             if (sound_detected && rms <= SILENCE_THRESHOLD) {
-                if (silence_start == 0) {
-                    silence_start = now;
-                } else if (now - silence_start >= SILENCE_TIMEOUT_MS) {
-                    ESP_LOGI(TAG, "LISTENING: 静音 %.0f ms → 说完了，上传音频",
-                             (float)(now - silence_start));
+                if (silence_start == 0) silence_start = now;
+                else if (now - silence_start >= SILENCE_TIMEOUT_MS) done = true;
+            }
+            if (sound_detected && (now - speak_start >= LISTEN_SPEAK_MAX_MS)) done = true;
 
-                    /* L7：把这段录音上传给服务器（切片→Opus→逐帧发） */
-                    mic_capture_stop();                 // 缓冲定格
-                    size_t nsamp = 0;
-                    const int16_t *cap = mic_capture_get(&nsamp);
-                    if (cap && nsamp > 0) {
-                        if (comm_is_connected()) {
-                            comm_send_audio_frames(cap, nsamp);
-                            comm_send_json("{\"type\":\"audio_end\"}");  // 告诉服务器：这段说完了
-                            oled_show_lines("你说完", "了，等回复", NULL, NULL);
-                        } else {
-                            ESP_LOGW(TAG, "未连服务器，录音已丢弃（%u 样本）", (unsigned)nsamp);
-                        }
-                    }
-
-                    sound_detected = false;
-                    silence_start = 0;
-                    listen_start = 0;
-                    bot_set_state(STATE_THINKING);
-                    break;  // 状态已变，跳出 switch
+            if (done) {
+                ESP_LOGI(TAG, "LISTENING: 说完了（静音或达 %d ms 上限），结束本轮音频",
+                         LISTEN_SPEAK_MAX_MS);
+                /* 流式上传：mic_task 已在说话过程中逐帧发完，这里只停流 + 发 audio_end。
+                 * 不再整段缓冲上传（旧 comm_send_audio_frames 已废弃于此路径）。 */
+                mic_capture_stop();                 // 停止流式上传（flush 尾帧）
+                if (comm_is_connected()) {
+                    bot_set_state(STATE_THINKING);  // 先切 THINKING（紫/思考中）
+                    comm_send_json("{\"type\":\"audio_end\"}");  // 告诉服务器：这段说完了
+                    oled_show_lines("你说完", "了，等回复", NULL, NULL);
+                } else {
+                    ESP_LOGW(TAG, "未连服务器，本轮音频已丢弃");
                 }
+                sound_detected = false;
+                silence_start = 0;
+                listen_start = 0;
+                speak_start = 0;
+                break;  // 状态已变，跳出 switch
             }
 
             /* 超时：等了 LISTEN_MAX_MS 还没人说话 → 退回 IDLE */

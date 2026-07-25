@@ -16,3 +16,6 @@ dependencies:
   #   public: true
   espressif/led_strip: '*'
   espressif/esp_websocket_client: '*'
+  # 离线语音唤醒（WakeNet）+ 命令词（MultiNet）引擎。
+  # 需要 >=2.4.1（起支持 ESP-IDF v6.0）；这里用最新稳定版，含"你好小智"等预置唤醒词模型。
+  espressif/esp-sr: '>=2.4.1'

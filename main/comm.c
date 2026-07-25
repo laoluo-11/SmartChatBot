@@ -44,8 +44,28 @@ typedef struct {
 static QueueHandle_t s_play_q = NULL;
 static bool s_audio_ended = false;     // 服务器已发完这轮音频
 
-#define PLAY_TASK_STACK  6144
+/* ---- WebSocket 二进制消息"分片重组"缓冲 ----
+ * 【关键 bug 修复】esp_websocket_client 的接收缓冲默认 1024 字节，而我们一帧
+ * PCM 消息 = 1 字节 codec + 1920 字节音频 = 1921 字节 → 一条消息会拆成
+ * 多次 WEBSOCKET_EVENT_DATA 事件（用 payload_offset / payload_len 标进度）。
+ * 之前的代码把"每一片"都当成完整帧、都剥第 1 字节当 codec：
+ *   - 第 1 片剥的确实是 codec，但剩 1023 字节（奇数）→ 尾部丢 1 字节；
+ *   - 第 2 片剥掉的是"音频数据"→ 整片 PCM 错位 1 字节（高低字节互换）！
+ * 于是每 60ms 音频 = 前一半正常 + 后一半字节错位的金属杂讯，周期性交替
+ * → 这就是"汽车人/金属机器音"的元凶。必须按 payload_offset 重组整条消息。 */
+static uint8_t *s_rx_asm     = NULL;   // 重组缓冲（存 codec 之后的音频负载）
+static size_t   s_rx_asm_cap = 0;      // 缓冲容量
+static uint8_t  s_rx_codec   = 0;      // 本条消息的 codec（第 1 片的第 1 字节）
+static bool     s_rx_valid   = false;  // 本条消息是否有效（分配失败等则整条丢弃）
+
+#define PLAY_TASK_STACK  10240
 #define PLAY_Q_LEN      48
+
+/* 预缓冲帧数：收到第一帧后不立刻开播，先等队列攒到这么多帧（每帧 960样本@16k=60ms，
+ * 5 帧 ≈ 300ms）再开始播放。这样 WiFi 抖动时 DMA 不容易被掏空（欠载），消除流式
+ * 播放的"断续/机器人抖动感"。若服务器提前发完(audio_end)则不足该数也立即开播。 */
+#define PLAY_PREBUF_FRAMES  5
+#define PLAY_PREBUF_WAIT_MS 600   /* 最多等这么久，防止服务器慢导致迟迟不出声 */
 
 /* =========================================================================
  * 事件处理：连上 / 断开 / 收到数据 都是"异步事件"
@@ -76,14 +96,41 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
         int len = d->data_len;
 
         if (d->op_code == WS_TRANSPORT_OPCODES_BINARY) {
-            /* 二进制帧 = [1字节 codec] + 音频负载 → 入队，交给播放任务 */
-            uint8_t codec = buf[0];
-            int payload_len = len - 1;
-            if (payload_len <= 0) return;
-            uint8_t *copy = (uint8_t *)malloc((size_t)payload_len);
+            /* 二进制消息 = [1字节 codec] + 音频负载。
+             * 一条消息可能分多片到达（见 s_rx_asm 注释），必须按 payload_offset
+             * 重组，只有"第 1 片的第 1 字节"才是 codec，其余全是音频数据！ */
+            size_t total_payload = (size_t)d->payload_len;   // 整条消息总长（含 codec）
+            if (total_payload <= 1) return;
+            size_t audio_total = total_payload - 1;          // 音频负载总长
+
+            if (d->payload_offset == 0) {
+                /* 新消息的第 1 片：取 codec，准备重组缓冲 */
+                s_rx_codec = buf[0];
+                s_rx_valid = false;
+                if (audio_total > s_rx_asm_cap) {            // 缓冲不够就换大的（复用，不频繁 malloc）
+                    free(s_rx_asm);
+                    s_rx_asm = (uint8_t *)malloc(audio_total);
+                    s_rx_asm_cap = s_rx_asm ? audio_total : 0;
+                }
+                if (!s_rx_asm) return;                       // 内存不足，整条消息丢弃
+                s_rx_valid = true;
+                memcpy(s_rx_asm, buf + 1, (size_t)len - 1);  // 去掉 codec 后拷入
+            } else {
+                /* 后续分片：整片都是音频数据，按偏移续写（-1 是扣掉 codec 字节） */
+                if (!s_rx_valid) return;
+                size_t off = (size_t)d->payload_offset - 1;
+                if (off + (size_t)len > s_rx_asm_cap) { s_rx_valid = false; return; }  // 越界保护
+                memcpy(s_rx_asm + off, buf, (size_t)len);
+            }
+
+            /* 整条消息收齐了才入队（最后一片：offset + len == payload_len） */
+            if ((size_t)d->payload_offset + (size_t)len < total_payload) return;
+            if (!s_rx_valid) return;
+
+            uint8_t *copy = (uint8_t *)malloc(audio_total);
             if (!copy) return;
-            memcpy(copy, buf + 1, (size_t)payload_len);
-            audio_frame_t f = { .data = copy, .len = (size_t)payload_len, .codec = codec };
+            memcpy(copy, s_rx_asm, audio_total);
+            audio_frame_t f = { .data = copy, .len = audio_total, .codec = s_rx_codec };
             /* 队列满就丢最旧的一帧，避免播放卡死（宁可少一段，不要卡住） */
             if (xQueueSend(s_play_q, &f, 0) != pdTRUE) {
                 audio_frame_t drop;
@@ -113,6 +160,10 @@ esp_err_t comm_init(const char *uri, comm_ctrl_cb_t ctrl_cb)
         .uri = uri,
         .disable_auto_reconnect = false,
         .reconnect_timeout_ms   = 4000,
+        .task_stack             = 10240,   /* 显式加大 websocket 内部任务栈，避免 recv 时栈溢出破坏 client->lock */
+        .buffer_size            = 4096,    /* 【关键】默认 1024 < 一帧 PCM 1921 字节 → 消息被分片，
+                                            * 旧代码不重组导致 PCM 错位 1 字节（"汽车人"金属声）。
+                                            * 加到 4096 让整帧一次到齐；分片重组逻辑仍保留作兜底。 */
     };
     s_client = esp_websocket_client_init(&cfg);
     if (!s_client) {
@@ -188,6 +239,7 @@ esp_err_t comm_send_audio_frames(const int16_t *pcm, size_t samples)
             frames++;
         }
         sent += OPUS_FRAME_SAMPLES;
+        vTaskDelay(pdMS_TO_TICKS(1));   /* 每帧让出 CPU，避免长循环饿死 websocket/播放任务、降低栈压力 */
     }
     free(tmp);
     ESP_LOGI(TAG, "已上传 %d 个音频帧（%u 样本）", frames, (unsigned)sent);
@@ -207,6 +259,15 @@ static void playback_task(void *arg)
     while (1) {
         if (xQueueReceive(s_play_q, &f, pdMS_TO_TICKS(500)) == pdTRUE) {
             if (!playing) {                       // 这一轮音频的第一帧
+                /* 预缓冲：先别急着开播。等队列再攒 PLAY_PREBUF_FRAMES 帧（≈300ms 余量），
+                 * 或等到 audio_end / 超时。否则服务器逐帧"贴着实时"发送时，
+                 * WiFi 稍一抖 DMA 就欠载 → 断续机器人声。 */
+                int waited = 0;
+                while (uxQueueMessagesWaiting(s_play_q) < PLAY_PREBUF_FRAMES - 1 &&
+                       !s_audio_ended && waited < PLAY_PREBUF_WAIT_MS) {
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                    waited += 20;
+                }
                 playing = true;
                 audio_out_stream_begin();          // 打开喇叭 I2S 通道
                 if (s_play_start_cb) s_play_start_cb();

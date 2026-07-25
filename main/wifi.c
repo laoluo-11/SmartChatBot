@@ -23,6 +23,9 @@
 #include "esp_http_server.h" // 配网用的轻量网页服务器
 #include "nvs_flash.h"       // NVS 存储（掉电不丢）
 #include <string.h>
+#include <stdio.h>            // sscanf（表单 URL 解码用）
+#include <stdlib.h>           // malloc / free（扫描结果缓冲）
+#include <ctype.h>            // isxdigit（URL 解码用）
 
 static const char *TAG = "wifi";
 
@@ -30,6 +33,7 @@ static const char *TAG = "wifi";
 static wifi_connected_cb_t s_connected_cb = NULL;   // "连上 WiFi"回调（可为空）
 static httpd_handle_t      s_server = NULL;         // 配网页服务器句柄
 static int                 s_retry_num = 0;         // STA 断线重连次数
+static wifi_provisioning_cb_t s_provisioning_cb = NULL;  // "需重新配网"回调（可为空）
 #define WIFI_MAX_RETRY      5                        // 最多重连几次
 
 /* 配网热点信息（ESP32 变成的这个 WiFi 的名字/参数） */
@@ -89,7 +93,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             s_retry_num++;
             ESP_LOGW(TAG, "WiFi 断开，重连中 (%d/%d)...", s_retry_num, WIFI_MAX_RETRY);
         } else {
-            ESP_LOGE(TAG, "WiFi 重连 %d 次仍失败，请检查密码或重新配网", WIFI_MAX_RETRY);
+            ESP_LOGW(TAG, "WiFi 重连 %d 次仍失败，自动进入配网模式（开 SoftAP 热点）", WIFI_MAX_RETRY);
+            if (s_provisioning_cb) s_provisioning_cb();   // 通知 main 切 PROVISIONING 显示
+            esp_wifi_stop();                               // 先停当前 STA，才能切 AP 模式
+            wifi_start_provisioning();                    // 开 SoftAP 热点 + 网页服务器
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         /* 真正连上了：拿到 IP 地址。 */
@@ -138,6 +145,11 @@ void wifi_register_connected_cb(wifi_connected_cb_t cb)
     s_connected_cb = cb;
 }
 
+void wifi_register_provisioning_cb(wifi_provisioning_cb_t cb)
+{
+    s_provisioning_cb = cb;
+}
+
 /* =========================================================================
  * STA 模式：用存档账号连家里 WiFi
  * ========================================================================= */
@@ -183,6 +195,7 @@ static void provisioning_finish(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
     ESP_ERROR_CHECK(esp_wifi_start());
+    s_retry_num = 0;   // 重置重连计数：新账号若连不上，重新计 5 次再退回配网
     ESP_ERROR_CHECK(esp_wifi_connect());
     ESP_LOGI(TAG, "配网完成，切换到 STA 连接家里 WiFi: %s", ssid);
 }
@@ -191,19 +204,198 @@ static void provisioning_finish(void)
  * 配网网页服务器：GET 返回填写页面，POST 收账号并存 NVS
  * ========================================================================= */
 
-/* 一个超简单的 HTML 表单页（手机浏览器打开就能填）。 */
+/* 配网网页（手机浏览器打开就能填）。
+ * 改进点：打开页面会自动 fetch /api/scan 扫描附近 WiFi，
+ * 用自绘的自定义下拉列表（div 弹层，兼容手机浏览器）把搜到的
+ * 网络名做成可点选列表，不用手动敲 SSID，也支持手输与实时过滤。 */
 static const char *PROV_HTML =
-    "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<title>ESP32 配网</title></head><body style=\"font-family:sans-serif;padding:16px\">"
-    "<h2>ESP32 语音机器人 配网</h2>"
-    "<form method=\"post\" action=\"/\">"
-    "WiFi 名称(SSID):<br><input name=\"ssid\" style=\"width:100%;padding:8px\"><br><br>"
-    "WiFi 密码:<br><input name=\"password\" type=\"password\" style=\"width:100%;padding:8px\"><br><br>"
-    "<button type=\"submit\" style=\"padding:10px 20px\">保存并连接</button>"
-    "</form></body></html>";
+"<!DOCTYPE html><html lang='zh'><head>"
+"<meta charset='utf-8'>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>ESP32 配网</title>"
+"<style>"
+"body{font-family:-apple-system,Segoe UI,sans-serif;padding:16px;max-width:420px;margin:auto;color:#222}"
+"h2{font-size:20px;margin:0 0 4px}"
+"label{display:block;margin:14px 0 4px;font-weight:bold}"
+"input{width:100%;padding:10px;font-size:16px;box-sizing:border-box;border:1px solid #ccc;border-radius:6px}"
+"button{padding:12px 18px;font-size:15px;background:#1a73e8;color:#fff;border:0;border-radius:6px;cursor:pointer}"
+".row{display:flex;gap:8px;align-items:stretch}"
+".row input{flex:1}"
+".muted{color:#666;font-size:13px;margin:6px 0}"
+".ssid-box{position:relative}"
+".ssid-pop{position:absolute;left:0;right:0;top:100%;margin-top:4px;background:#fff;border:1px solid #ccc;border-radius:6px;max-height:240px;overflow:auto;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,.12);display:none}"
+".ssid-pop.open{display:block}"
+".ssid-pop div{padding:10px 12px;font-size:15px;border-bottom:1px solid #f0f0f0;cursor:pointer;display:flex;justify-content:space-between;gap:8px}"
+".ssid-pop div:last-child{border-bottom:0}"
+".ssid-pop div:active{background:#eef4ff}"
+".ssid-pop .sig{color:#1a73e8;font-family:monospace;white-space:nowrap}"
+".ssid-pop .none{padding:10px 12px;color:#999;font-size:14px}"
+"</style></head><body>"
+"<h2>ESP32 语音机器人 · 配网</h2>"
+"<p class='muted'>已自动扫描附近 WiFi，点选网络并输入密码即可。</p>"
+"<form method='post' action='/' onsubmit='return checkForm()'>"
+"<label>WiFi 网络</label>"
+"<div class='ssid-box'>"
+"<div class='row'>"
+"<input name='ssid' id='ssid' placeholder='选择或输入 WiFi 名称' autocomplete='off' oninput='filterList()' onfocus='showList()'>"
+"<button type='button' onclick='scan()'>刷新</button>"
+"</div>"
+"<div id='ssidlist' class='ssid-pop'></div>"
+"</div>"
+"<div class='muted' id='hint'>正在扫描…</div>"
+"<label>WiFi 密码</label>"
+"<input name='password' type='password' placeholder='开放网络可留空'>"
+"<button type='submit' style='width:100%;margin-top:12px'>保存并连接</button>"
+"</form>"
+"<script>"
+"var allAps=[];"
+"function sigBars(r){"
+" if(r>=-50)return '▂▄▆█';"
+" if(r>=-60)return '▂▄▆';"
+" if(r>=-70)return '▂▄';"
+" return '▂';"
+"}"
+"function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}"
+"function showList(){document.getElementById('ssidlist').classList.add('open');}"
+"function hideList(){document.getElementById('ssidlist').classList.remove('open');}"
+"function renderList(q){"
+" var box=document.getElementById('ssidlist');"
+" box.innerHTML='';"
+" var list=allAps.filter(function(a){return !q||a.ssid.toLowerCase().indexOf(q.toLowerCase())>=0;});"
+" if(list.length===0){box.innerHTML='<div class=\"none\">没有匹配的网络，可直接输入</div>';return;}"
+" list.forEach(function(a){"
+"  var d=document.createElement('div');"
+"  d.innerHTML='<span>'+esc(a.ssid)+'</span><span class=\"sig\">'+sigBars(a.rssi)+(a.auth===0?'（开放）':'')+'</span>';"
+"  d.onclick=function(){document.getElementById('ssid').value=a.ssid;hideList();};"
+"  box.appendChild(d);"
+" });"
+"}"
+"function filterList(){var v=document.getElementById('ssid').value;renderList(v);showList();}"
+"function scan(){"
+" var hint=document.getElementById('hint');"
+" hint.textContent='正在扫描…';"
+" fetch('/api/scan').then(function(r){return r.json();}).then(function(d){"
+"  allAps=d.aps||[];"
+"  if(allAps.length===0){hint.textContent='未找到网络，可直接手动输入';return;}"
+"  renderList('');showList();"
+"  hint.textContent='已找到 '+allAps.length+' 个网络';"
+" }).catch(function(){hint.textContent='扫描失败，可直接手动输入或点刷新';});"
+"}"
+"document.addEventListener('click',function(e){if(!e.target.closest('.ssid-box'))hideList();});"
+"scan();"
+"</script>"
+"</body></html>";
 
-/* 从 "key=value&key2=value2" 形式的 body 里取某个 key 的值（最小实现）。 */
+/* 把 SSID 转成 JSON 安全的字符串：转义 " \ 和控制字符，其余 UTF-8 原样保留。 */
+static void json_escape_ssid(const char *in, char *out, size_t out_len)
+{
+    size_t o = 0;
+    for (size_t i = 0; in[i] != '\0' && o + 8 < out_len; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"' || c == '\\') {
+            out[o++] = '\\';
+            out[o++] = (char)c;
+        } else if (c < 0x20) {
+            int n = snprintf(out + o, out_len - o, "\\u%04x", c);
+            o += (size_t)n;
+        } else {
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
+#define PROV_MAX_AP 20
+
+/* 扫描周围 WiFi，结果写成 JSON 到 out（调用方分配，长度 out_len）。
+ * 格式：{"count":N,"aps":[{"ssid":"...","rssi":-45,"auth":3,"ch":6}, ...]} */
+static esp_err_t wifi_scan_to_json(char *out, size_t out_len)
+{
+    wifi_scan_config_t scan_cfg = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time = { .active = { .min = 100, .max = 300 } },
+    };
+    esp_err_t r = esp_wifi_scan_start(&scan_cfg, true);   // 阻塞式扫描
+    if (r != ESP_OK) {
+        snprintf(out, out_len, "{\"count\":0,\"error\":\"scan_start\"}");
+        return r;
+    }
+
+    uint16_t num = PROV_MAX_AP;
+    wifi_ap_record_t *aps = malloc(sizeof(wifi_ap_record_t) * PROV_MAX_AP);
+    if (!aps) {
+        snprintf(out, out_len, "{\"count\":0,\"error\":\"oom\"}");
+        return ESP_FAIL;
+    }
+    r = esp_wifi_scan_get_ap_records(&num, aps);
+    if (r != ESP_OK) {
+        free(aps);
+        snprintf(out, out_len, "{\"count\":0,\"error\":\"get_records\"}");
+        return r;
+    }
+
+    /* 去重：同一 SSID 只保留信号最强的一条。 */
+    wifi_ap_record_t uniq[PROV_MAX_AP];
+    int uniq_n = 0;
+    for (int i = 0; i < (int)num; i++) {
+        int j;
+        for (j = 0; j < uniq_n; j++) {
+            /* ssid[33] 由 ESP-IDF 保证以 '\0' 结尾，strncmp 限长 32 防止越界。 */
+            if (strncmp((char *)aps[i].ssid, (char *)uniq[j].ssid, 32) == 0) {
+                if (aps[i].rssi > uniq[j].rssi) uniq[j] = aps[i];
+                break;
+            }
+        }
+        if (j == uniq_n && uniq_n < PROV_MAX_AP) uniq[uniq_n++] = aps[i];
+    }
+    free(aps);
+
+    /* 按信号强度排序（强在前），前端展示更直观。 */
+    for (int i = 0; i < uniq_n - 1; i++) {
+        for (int j = i + 1; j < uniq_n; j++) {
+            if (uniq[j].rssi > uniq[i].rssi) {
+                wifi_ap_record_t t = uniq[i];
+                uniq[i] = uniq[j];
+                uniq[j] = t;
+            }
+        }
+    }
+
+    int off = snprintf(out, out_len, "{\"count\":%d,\"aps\":[", uniq_n);
+    for (int i = 0; i < uniq_n; i++) {
+        if ((size_t)off + 256 >= out_len) break;   // 余量保护，避免越界
+        char esc[200];
+        json_escape_ssid((char *)uniq[i].ssid, esc, sizeof(esc));
+        off += snprintf(out + off, out_len - off,
+                        "%s{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d,\"ch\":%d}",
+                        (i ? "," : ""), esc, (int)uniq[i].rssi,
+                        (int)uniq[i].authmode, (int)uniq[i].primary);
+    }
+    snprintf(out + off, out_len - off, "]}");
+    return ESP_OK;
+}
+
+/* GET /api/scan：返回附近 WiFi 的 JSON 列表，给网页自动填充下拉框。 */
+static esp_err_t prov_scan_handler(httpd_req_t *req)
+{
+    char *buf = malloc(4096);
+    if (!buf) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    wifi_scan_to_json(buf, 4096);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    free(buf);
+    return ESP_OK;
+}
+
+/* 从 "key=value&key2=value2" 形式的 body 里取某个 key 的值。
+ * 做了完整的 URL 解码：%XX -> 字节，'+' -> 空格（这样中文 SSID 也能正确解析）。 */
 static void parse_form_value(const char *body, const char *key,
                              char *out, size_t out_len)
 {
@@ -211,14 +403,24 @@ static void parse_form_value(const char *body, const char *key,
     if (!p) return;
     p += strlen(key) + 1;                 // 跳过 "key="
     char *end = strchr(p, '&');           // 值到下一个 & 或结尾
-    size_t len = end ? (size_t)(end - p) : strlen(p);
-    if (len >= out_len) len = out_len - 1;
-    memcpy(out, p, len);
-    out[len] = '\0';
-    /* 最小 URL 解码：把 '+' 还原成空格（密码里的 & 会截断，属已知简化限制）。 */
-    for (size_t i = 0; i < len; i++) {
-        if (out[i] == '+') out[i] = ' ';
+    size_t raw_len = end ? (size_t)(end - p) : strlen(p);
+
+    size_t o = 0;
+    for (size_t i = 0; i < raw_len && o < out_len - 1; ) {
+        if (p[i] == '%' && i + 2 < raw_len &&
+            isxdigit((unsigned char)p[i + 1]) && isxdigit((unsigned char)p[i + 2])) {
+            unsigned int v = 0;
+            sscanf(p + i + 1, "%2x", &v);  // 把 %XX 两位十六进制转成字节
+            out[o++] = (char)v;
+            i += 3;
+        } else if (p[i] == '+') {
+            out[o++] = ' ';                // 表单里空格常被编码成 '+'
+            i++;
+        } else {
+            out[o++] = p[i++];
+        }
     }
+    out[o] = '\0';
 }
 
 static esp_err_t prov_get_handler(httpd_req_t *req)
@@ -262,12 +464,19 @@ static esp_err_t prov_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* 启动网页服务器（GET 看页面、POST 收账号）。 */
+/* 启动网页服务器（GET 看页面、POST 收账号、GET /api/scan 出 WiFi 列表）。 */
 static esp_err_t start_prov_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.uri_match_fn = httpd_uri_match_wildcard;   // 支持 "/*" 通配
+    config.uri_match_fn = httpd_uri_match_wildcard;   // 支持通配符匹配
+    config.stack_size   = 5120;                        // 扫描时留足栈空间
 
+    static const httpd_uri_t uri_scan = {
+        .uri      = "/api/scan",
+        .method   = HTTP_GET,
+        .handler  = prov_scan_handler,
+        .user_ctx = NULL,
+    };
     static const httpd_uri_t uri_get = {
         .uri      = "/*",
         .method   = HTTP_GET,
@@ -282,6 +491,8 @@ static esp_err_t start_prov_http_server(void)
     };
 
     if (httpd_start(&s_server, &config) == ESP_OK) {
+        /* 精确匹配 /api/scan 优先于通配URI，确保扫描接口不被页面覆盖。 */
+        httpd_register_uri_handler(s_server, &uri_scan);
         httpd_register_uri_handler(s_server, &uri_get);
         httpd_register_uri_handler(s_server, &uri_post);
         return ESP_OK;
