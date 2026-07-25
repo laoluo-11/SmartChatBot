@@ -40,7 +40,7 @@ static uint32_t g_spk_start_ms = 0;
  * 阈值 80 能清晰区分"说/没说"。若改了录音方式导致"一直有声音"或"检测不到说话"，回头调这里。 */
 #define SILENCE_THRESHOLD   80.0f
 /* 静音持续多久（毫秒）才确认用户说完了，自动切到 THINKING */
-#define SILENCE_TIMEOUT_MS  1500
+#define SILENCE_TIMEOUT_MS  2000
 /* LISTENING 最长等多久（毫秒），超时还没人说话就退回 IDLE */
 #define LISTEN_MAX_MS       8000
 /* LISTENING 单次说话最长多久（毫秒）：防止一直说不停导致连接/服务端超限，到点强制结束 */
