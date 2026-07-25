@@ -272,8 +272,17 @@ static void playback_task(void *arg)
                 audio_out_stream_begin();          // 打开喇叭 I2S 通道
                 if (s_play_start_cb) s_play_start_cb();
             }
-            int n = opus_decode_packet(f.data, (int)f.len, pcm,
+            int n;
+            if (f.codec == CODEC_PCM) {
+                /* 服务器发的是 raw PCM，直接拷到 pcm 缓冲，无解码 */
+                n = (int)f.len / (int)sizeof(int16_t);
+                int cap = OPUS_FRAME_SAMPLES;
+                if (n > cap) n = cap;
+                memcpy(pcm, f.data, (size_t)n * sizeof(int16_t));
+            } else {
+                n = opus_decode_packet(f.data, (int)f.len, pcm,
                                        OPUS_FRAME_SAMPLES * (int)sizeof(int16_t) + 64);
+            }
             if (n > 0) audio_out_play_pcm(pcm, (size_t)n);
             free(f.data);
 
