@@ -31,6 +31,8 @@
 #include "esp_lcd_panel_ssd1306.h"              // SSD1306 专用配置 + 建面板
 #include "esp_lcd_panel_ops.h"                  // panel 句柄、draw_bitmap、init/reset
 #include "driver/i2c_master.h"                  // v6 的 I2C 主总线 API
+#include "esp_timer.h"                          // 滚动显示用的周期定时器
+#include "oled_font_cjk.h"                      // 16x16 中文点阵字库（自动生成）
 
 static const char *TAG = "oled";               // 日志标签："oled: ..."
 
@@ -48,6 +50,25 @@ static uint8_t g_fb[OLED_WIDTH * OLED_HEIGHT / 8];
 /* SSD1306 面板句柄：初始化成功后非空，后面 draw_bitmap 都用它 */
 static esp_lcd_panel_handle_t g_panel = NULL;
 /* 8x8 点阵字库 font8x8_basic[128][8] 在 font8x8.h 里（已单独拆文件） */
+
+/* ---- 中文回答滚动显示状态 ----
+ * 128x64 屏用 16x16 字只能放 8 列 × 4 行 ≈ 32 字，长回答需自动换行 + 纵向滚动。
+ * g_answer_showing 为 true 时，状态机的状态屏(oled_show_status/oled_show_lines)让位，
+ * 避免把正在显示的回答冲掉。 */
+#define OLED_ANSWER_MAX_LINES  64        // 最多缓存行数（防止超长回答爆缓冲）
+#define OLED_ANSWER_ROW_H      16        // 每行高 16 像素（16x16 字）
+#define OLED_ANSWER_VISIBLE    4         // 一屏可见 4 行（64px）
+#define OLED_ANSWER_SCROLL_MS  800       // 每 800ms 向上滚一行
+#define OLED_ANSWER_BUF_LEN    700       // 回答文本缓冲（Qwen 已要求简短，够用）
+
+typedef struct { int off; int len; } ans_line_t;
+
+static char        g_answer_buf[OLED_ANSWER_BUF_LEN];
+static ans_line_t  g_answer_lines[OLED_ANSWER_MAX_LINES];
+static int         g_answer_nlines = 0;
+static int         g_answer_scroll = 0;
+static bool        g_answer_showing = false;
+static esp_timer_handle_t g_scroll_timer = NULL;
 
 /* -------------------------------------------------------------------------
  * oled_init：初始化 OLED（建 I2C 总线 → panel IO → SSD1306 面板）
@@ -183,6 +204,7 @@ void oled_draw_text(int x, int y, const char *str)
  * ------------------------------------------------------------------------- */
 void oled_show_lines(const char *l0, const char *l1, const char *l2, const char *l3)
 {
+    if (g_answer_showing) return;          // 正在显示回答，状态屏让位
     oled_clear();
     if (l0) oled_draw_text(0, 0,  l0);   // 第 0 行（y=0）
     if (l1) oled_draw_text(0, 8,  l1);   // 第 1 行（y=8）
@@ -196,5 +218,187 @@ void oled_show_lines(const char *l0, const char *l1, const char *l2, const char 
  * ------------------------------------------------------------------------- */
 void oled_show_status(const char *status)
 {
+    if (g_answer_showing) return;          // 正在显示回答，状态屏让位
     oled_show_lines("STATE:", status, NULL, NULL);
+}
+
+/* =========================================================================
+ * 中文显示：16x16 点阵 + 中英混排 + 自动换行 + 纵向滚动
+ * ========================================================================= */
+
+/* 在 (x,y) 画一个 16x16 字形。g 共 32 字节：第 r 行 = g[2r](左8) + g[2r+1](右8)，
+ * 字节里 bit7 = 最左像素。（与 oled_font_cjk.h 的排版一一对应） */
+static void oled_draw_glyph16(int x, int y, const uint8_t *g)
+{
+    if (!g) return;
+    for (int r = 0; r < 16; r++) {
+        uint8_t hi = g[2 * r];
+        uint8_t lo = g[2 * r + 1];
+        for (int c = 0; c < 8; c++) {
+            if (hi & (1 << (7 - c))) oled_draw_pixel(x + c,     y + r, true);
+        }
+        for (int c = 0; c < 8; c++) {
+            if (lo & (1 << (7 - c))) oled_draw_pixel(x + 8 + c, y + r, true);
+        }
+    }
+}
+
+/* 画一个 16x16 的空心方框，用作“字库里没有的字”的兜底占位 */
+static void oled_draw_box16(int x, int y)
+{
+    for (int c = 0; c < 16; c++) {
+        oled_draw_pixel(x + c, y,      true);
+        oled_draw_pixel(x + c, y + 15, true);
+    }
+    for (int r = 0; r < 16; r++) {
+        oled_draw_pixel(x,      y + r, true);
+        oled_draw_pixel(x + 15, y + r, true);
+    }
+}
+
+/* 在 CJK_CODES[](升序) 中二分查找 unicode，返回对应点阵或 NULL */
+static const uint8_t *cjk_find(uint16_t cp)
+{
+    int lo = 0, hi = (int)CJK_COUNT - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (CJK_CODES[mid] == cp)      return CJK_GLYPHS[mid];
+        else if (CJK_CODES[mid] < cp)  lo = mid + 1;
+        else                           hi = mid - 1;
+    }
+    return NULL;
+}
+
+/* 中英混排渲染：UTF-8 解码后，ASCII 用 8x8 字，其余用 16x16 字（找不到画方框）。
+ * 行高 16 像素；ASCII 宽 8、CJK 宽 16，两种宽度混排也能对齐到同一基线。 */
+void oled_draw_text_mixed(int x, int y, const char *str)
+{
+    if (!str) return;
+    int cur_x = x;
+    int n = (int)strlen(str);
+    for (int i = 0; i < n; ) {
+        unsigned char c0 = (unsigned char)str[i];
+        uint32_t cp; int clen;
+        if (c0 < 0x80)               { cp = c0;            clen = 1; }
+        else if ((c0 & 0xE0) == 0xC0){ cp = c0 & 0x1F;     clen = 2; }
+        else if ((c0 & 0xF0) == 0xE0){ cp = c0 & 0x0F;     clen = 3; }
+        else if ((c0 & 0xF8) == 0xF0){ cp = c0 & 0x07;     clen = 4; }
+        else                          { i++; continue; }            // 无效首字节，跳过
+        for (int k = 1; k < clen && i + k < n; k++)
+            cp = (cp << 6) | ((unsigned char)str[i + k] & 0x3F);
+        i += clen;
+
+        if (cp <= 0x7F) {
+            unsigned char ch = (unsigned char)cp;
+            if (ch < 0x20) ch = 0x20;
+            const uint8_t *gl = font8x8_basic[ch];
+            for (int r = 0; r < 8; r++) {
+                uint8_t line = gl[r];
+                for (int c = 0; c < 8; c++)
+                    if (line & (1 << (7 - c))) oled_draw_pixel(cur_x + c, y + r, true);
+            }
+            cur_x += 8;
+        } else {
+            const uint8_t *g = cjk_find((uint16_t)cp);
+            if (g) oled_draw_glyph16(cur_x, y, g);
+            else   oled_draw_box16(cur_x, y);
+            cur_x += 16;
+        }
+    }
+}
+
+/* 把回答文本按屏宽(128px)自动换行，结果存进 g_answer_lines[]（指向 g_answer_buf
+ * 内的偏移/长度，不另开内存）。遇到 '\n' 强制换行。 */
+static void oled_wrap_answer(const char *text)
+{
+    g_answer_nlines = 0;
+    int n = (int)strlen(text);
+    int line_start = 0, line_w = 0, i = 0;
+    while (i < n) {
+        unsigned char c0 = (unsigned char)text[i];
+        int clen, w; uint32_t cp;
+        if (c0 < 0x80)               { cp = c0;        clen = 1; }
+        else if ((c0 & 0xE0) == 0xC0){ cp = c0 & 0x1F; clen = 2; }
+        else if ((c0 & 0xF0) == 0xE0){ cp = c0 & 0x0F; clen = 3; }
+        else if ((c0 & 0xF8) == 0xF0){ cp = c0 & 0x07; clen = 4; }
+        else                          { i++; continue; }
+        for (int k = 1; k < clen && i + k < n; k++)
+            cp = (cp << 6) | ((unsigned char)text[i + k] & 0x3F);
+
+        if (c0 == '\n') {                                  // 硬换行
+            if (g_answer_nlines < OLED_ANSWER_MAX_LINES)
+                g_answer_lines[g_answer_nlines++] = (ans_line_t){ line_start, i - line_start };
+            i++; line_start = i; line_w = 0; continue;
+        }
+        w = (cp <= 0x7F) ? 8 : 16;
+        if (line_w + w > OLED_WIDTH && line_w > 0) {       // 这行放不下，另起一行
+            if (g_answer_nlines < OLED_ANSWER_MAX_LINES)
+                g_answer_lines[g_answer_nlines++] = (ans_line_t){ line_start, i - line_start };
+            line_start = i; line_w = 0;
+            /* 不消费本字符，留到新行开头 */
+        } else {
+            line_w += w; i += clen;
+        }
+    }
+    if (i > line_start && g_answer_nlines < OLED_ANSWER_MAX_LINES)
+        g_answer_lines[g_answer_nlines++] = (ans_line_t){ line_start, i - line_start };
+}
+
+/* 把当前滚动位置对应的若干行画到帧缓冲并刷新 */
+static void oled_render_answer(void)
+{
+    oled_clear();
+    for (int k = 0; k < OLED_ANSWER_VISIBLE; k++) {
+        int li = g_answer_scroll + k;
+        if (li >= g_answer_nlines) break;
+        int s = g_answer_lines[li].off;
+        int l = g_answer_lines[li].len;
+        char tmp = g_answer_buf[s + l];
+        g_answer_buf[s + l] = '\0';                        // 临时截断，渲染后恢复
+        oled_draw_text_mixed(0, k * OLED_ANSWER_ROW_H, g_answer_buf + s);
+        g_answer_buf[s + l] = tmp;
+    }
+    oled_refresh();
+}
+
+/* 周期定时器回调：向上滚一行（仅在显示回答时生效） */
+static void oled_scroll_timer_cb(void *arg)
+{
+    (void)arg;
+    if (!g_answer_showing) return;
+    oled_render_answer();
+    if (g_answer_nlines > OLED_ANSWER_VISIBLE) {
+        g_answer_scroll++;
+        if (g_answer_scroll > g_answer_nlines - OLED_ANSWER_VISIBLE)
+            g_answer_scroll = 0;                           // 滚到末尾后回到开头循环
+    }
+}
+
+/* 显示服务器回答（自动换行 + 滚动）。text 最长 OLED_ANSWER_BUF_LEN-1。 */
+void oled_show_answer(const char *text)
+{
+    if (!text) return;
+    strncpy(g_answer_buf, text, OLED_ANSWER_BUF_LEN - 1);
+    g_answer_buf[OLED_ANSWER_BUF_LEN - 1] = '\0';
+    oled_wrap_answer(g_answer_buf);
+    g_answer_scroll = 0;
+    g_answer_showing = true;
+    if (!g_scroll_timer) {
+        esp_timer_handle_t t = NULL;
+        esp_timer_create(&(esp_timer_create_args_t){ .callback = oled_scroll_timer_cb,
+                                                      .name = "oled_scroll" }, &t);
+        g_scroll_timer = t;
+    }
+    if (g_scroll_timer) {
+        esp_timer_stop(g_scroll_timer);
+        esp_timer_start_periodic(g_scroll_timer, OLED_ANSWER_SCROLL_MS * 1000);
+    }
+    oled_render_answer();                                  // 立即显示第一屏
+}
+
+/* 隐藏回答、把屏幕交还给状态机 */
+void oled_answer_hide(void)
+{
+    g_answer_showing = false;
+    if (g_scroll_timer) esp_timer_stop(g_scroll_timer);
 }

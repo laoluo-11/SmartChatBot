@@ -400,7 +400,14 @@ async def ai_bot_handler(ws):
                     await ws.send(json.dumps({"type": "audio_end"}))
                     continue
 
-                # 3) DashScope TTS：文字 → 16kHz PCM 语音
+                # 3) 先把回复文字发给 ESP32——OLED 在“开口”的同时就显示出来
+                if transcript:
+                    await ws.send(json.dumps({"type": "transcript",
+                                               "text": transcript.strip()}))
+                    messages.append({"role": "assistant",
+                                     "content": transcript.strip()})
+
+                # 4) DashScope TTS：文字 → 16kHz PCM 语音
                 if HAS_TTS:
                     print(f"[*] TTS 合成中（{TTS_MODEL}/{TTS_VOICE}）...", flush=True)
                     try:
@@ -428,15 +435,7 @@ async def ai_bot_handler(ws):
                 else:
                     print("[!] TTS 不可用（需 pip install dashscope）")
 
-                # 4) 发送文本 & 标记音频结束
-                if transcript:
-                    await ws.send(json.dumps({"type": "transcript",
-                                               "text": transcript.strip()}))
-                    # 保存 assistant 回复到历史
-                    assistant_msg = {"role": "assistant",
-                                     "content": transcript.strip()}
-                    messages.append(assistant_msg)
-
+                # 5) 标记音频结束
                 await ws.send(json.dumps({"type": "audio_end"}))
                 print(f"[*] 回复完成")
 

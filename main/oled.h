@@ -46,5 +46,18 @@ void oled_draw_text(int x, int y, const char *str);
 void oled_show_lines(const char *l0, const char *l1, const char *l2, const char *l3);
 
 /* 便捷：显示“STATE:”+ 状态两行。这是给后面 L5 状态机准备的“状态显示屏”入口，
- * 比如 oled_show_status("LISTENING") 就会在屏幕上打出 STATE: / LISTENING。 */
+ * 比如 oled_show_status("LISTENING") 就会在屏幕上打出 STATE: / LISTENING。
+ * 注意：正在显示服务器回答（oled_show_answer）时，本函数与 oled_show_lines 都会
+ * 让位，避免把回答屏冲掉。 */
 void oled_show_status(const char *status);
+
+/* 中英混排渲染：UTF-8 自动识别——ASCII(0x20~0x7F)用 8x8 字体，中文/符号用 16x16
+ * 字库（见 oled_font_cjk.h）。行高固定 16 像素。用于在 128x64 屏上显示中文回答。 */
+void oled_draw_text_mixed(int x, int y, const char *str);
+
+/* 显示服务器回答：按屏宽(128px)自动换行；超过 4 行(=64px)时自动纵向滚动。
+ * 显示期间“霸屏”，状态机的状态提示不会抢屏，直到调用 oled_answer_hide 交还。 */
+void oled_show_answer(const char *text);
+
+/* 隐藏回答、把屏幕交还给状态机（一般在播放结束回到 IDLE 时调用）。 */
+void oled_answer_hide(void);

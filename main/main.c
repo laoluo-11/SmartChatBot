@@ -110,17 +110,20 @@ static void on_comm_connected(void)
 /* -------------------------------------------------------------------------
  * on_comm_ctrl：收到服务器 JSON 控制帧（L7）
  * 目前认两种字段：
- *   "transcript" ：用户说的话（ASR 结果）→ 屏幕显示
- *   "reply"      ：机器人的回复文本（LLM 结果）→ 屏幕显示
+ *   "transcript" ：机器人的回复文本（LLM 结果）→ OLED 中文显示
+ *   "reply"      ：短消息/错误文本（LLM 结果）→ OLED 中文显示
  *   含 "audio_end" ：服务器这轮音频发完 → 通知播放任务收尾
  * ------------------------------------------------------------------------- */
 static void on_comm_ctrl(const char *json)
 {
-    char buf[48];
+    char buf[256];
+    char line[320];
     if (comm_json_get_str(json, "transcript", buf, sizeof(buf)) == 0) {
-        oled_show_lines("你说:", buf, NULL, NULL);
+        snprintf(line, sizeof(line), "回复:%s", buf);
+        oled_show_answer(line);                       // 中文混排 + 自动换行/滚动
     } else if (comm_json_get_str(json, "reply", buf, sizeof(buf)) == 0) {
-        oled_show_lines("回复:", buf, NULL, NULL);
+        snprintf(line, sizeof(line), "回复:%s", buf);
+        oled_show_answer(line);
     }
     if (strstr(json, "audio_end") != NULL) {
         comm_mark_audio_end();            // 标记本轮音频结束，播放任务据此收尾
@@ -141,6 +144,7 @@ static void on_play_start(void)
 }
 static void on_play_end(void)
 {
+    oled_answer_hide();                   // 回答显示结束，把屏幕交还给状态机
     bot_set_state(STATE_IDLE);
 }
 

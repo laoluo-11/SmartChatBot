@@ -62,10 +62,10 @@ static bool     s_rx_valid   = false;  // 本条消息是否有效（分配失�
 #define PLAY_Q_LEN      48
 
 /* 预缓冲帧数：收到第一帧后不立刻开播，先等队列攒到这么多帧（每帧 960样本@16k=60ms，
- * 5 帧 ≈ 300ms）再开始播放。这样 WiFi 抖动时 DMA 不容易被掏空（欠载），消除流式
+ * 10 帧 ≈ 600ms）再开始播放。这样 WiFi 抖动时 DMA 不容易被掏空（欠载），消除流式
  * 播放的"断续/机器人抖动感"。若服务器提前发完(audio_end)则不足该数也立即开播。 */
-#define PLAY_PREBUF_FRAMES  5
-#define PLAY_PREBUF_WAIT_MS 600   /* 最多等这么久，防止服务器慢导致迟迟不出声 */
+#define PLAY_PREBUF_FRAMES  10
+#define PLAY_PREBUF_WAIT_MS 1200  /* 最多等这么久，防止服务器慢导致迟迟不出声 */
 
 /* =========================================================================
  * 事件处理：连上 / 断开 / 收到数据 都是"异步事件"
@@ -255,11 +255,12 @@ static void playback_task(void *arg)
     audio_frame_t f;
     int16_t *pcm = (int16_t *)malloc(OPUS_FRAME_SAMPLES * sizeof(int16_t) + 64);
     bool playing = false;
+    static uint32_t s_last_underrun_log = 0;   // 抖动暂歇日志节流
 
     while (1) {
-        if (xQueueReceive(s_play_q, &f, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (xQueueReceive(s_play_q, &f, pdMS_TO_TICKS(150)) == pdTRUE) {
             if (!playing) {                       // 这一轮音频的第一帧
-                /* 预缓冲：先别急着开播。等队列再攒 PLAY_PREBUF_FRAMES 帧（≈300ms 余量），
+                /* 预缓冲：先别急着开播。等队列再攒 PLAY_PREBUF_FRAMES 帧（≈600ms 余量），
                  * 或等到 audio_end / 超时。否则服务器逐帧"贴着实时"发送时，
                  * WiFi 稍一抖 DMA 就欠载 → 断续机器人声。 */
                 int waited = 0;
@@ -294,12 +295,23 @@ static void playback_task(void *arg)
                 if (s_play_end_cb) s_play_end_cb();
             }
         } else {
-            /* 500ms 没新帧：若已宣布结束且队列空，收尾 */
-            if (playing && uxQueueMessagesWaiting(s_play_q) == 0 && s_audio_ended) {
-                playing = false;
-                s_audio_ended = false;
-                audio_out_stream_end();
-                if (s_play_end_cb) s_play_end_cb();
+            /* 150ms 没新帧 */
+            if (playing) {
+                if (uxQueueMessagesWaiting(s_play_q) == 0 && s_audio_ended) {
+                    /* 正常收尾：服务器发完且队列清空 */
+                    playing = false;
+                    s_audio_ended = false;
+                    audio_out_stream_end();
+                    if (s_play_end_cb) s_play_end_cb();
+                } else if (uxQueueMessagesWaiting(s_play_q) == 0 && !s_audio_ended) {
+                    /* 队列空但服务器还没宣布结束 = 网络/合成抖动造成的暂歇，
+                     * DMA 此时靠 auto_clear 输出静音避免爆音。打印一行便于排查卡顿。 */
+                    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+                    if (now - s_last_underrun_log > 1000) {
+                        ESP_LOGW(TAG, "播放暂歇(队列空/未 audio_end)，可能网络抖动");
+                        s_last_underrun_log = now;
+                    }
+                }
             }
         }
     }
